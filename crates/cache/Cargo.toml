@@ -13,7 +13,6 @@ anyhow = { workspace = true }
 base64 = "0.21.0"
 bincode = "1.1.4"
 directories-next = "2.0"
-file-per-thread-logger = "0.1.1"
 log = { workspace = true }
 serde = { version = "1.0.94", features = ["derive"] }
 sha2 = "0.10.2"
@@ -32,5 +31,5 @@ rustix = { workspace = true, features = ["process"] }
 [dev-dependencies]
 filetime = "0.2.7"
 once_cell = { workspace = true }
-pretty_env_logger = "0.4.0"
+pretty_env_logger = { workspace = true }
 tempfile = "3"

@@ -29,9 +29,11 @@ use std::{mem, ptr};
 use wasmtime_environ::{
     packed_option::ReservedValue, DataIndex, DefinedGlobalIndex, DefinedMemoryIndex,
     DefinedTableIndex, ElemIndex, EntityIndex, EntityRef, EntitySet, FuncIndex, GlobalIndex,
-    GlobalInit, HostPtr, MemoryIndex, Module, PrimaryMap, SignatureIndex, TableIndex,
-    TableInitialization, Trap, VMOffsets, WasmType, VMCONTEXT_MAGIC,
+    GlobalInit, HostPtr, MemoryIndex, MemoryPlan, Module, PrimaryMap, SignatureIndex, TableIndex,
+    TableInitialValue, Trap, VMOffsets, WasmHeapType, WasmRefType, WasmType, VMCONTEXT_MAGIC,
 };
+#[cfg(feature = "wmemcheck")]
+use wasmtime_wmemcheck::Wmemcheck;
 
 mod allocator;
 
@@ -65,13 +67,21 @@ pub struct Instance {
     ///
     /// This is where all runtime information about defined linear memories in
     /// this module lives.
-    memories: PrimaryMap<DefinedMemoryIndex, Memory>,
+    ///
+    /// The `MemoryAllocationIndex` was given from our `InstanceAllocator` and
+    /// must be given back to the instance allocator when deallocating each
+    /// memory.
+    memories: PrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)>,
 
     /// WebAssembly table data.
     ///
     /// Like memories, this is only for defined tables in the module and
     /// contains all of their runtime state.
-    tables: PrimaryMap<DefinedTableIndex, Table>,
+    ///
+    /// The `TableAllocationIndex` was given from our `InstanceAllocator` and
+    /// must be given back to the instance allocator when deallocating each
+    /// table.
+    tables: PrimaryMap<DefinedTableIndex, (TableAllocationIndex, Table)>,
 
     /// Stores the dropped passive element segments in this instantiation by index.
     /// If the index is present in the set, the segment has been dropped.
@@ -86,13 +96,6 @@ pub struct Instance {
     /// Most of the time from Wasmtime this is `Box::new(())`, a noop
     /// allocation, but some host-defined objects will store their state here.
     host_state: Box<dyn Any + Send + Sync>,
-
-    /// Instance of this instance within its `InstanceAllocator` trait
-    /// implementation.
-    ///
-    /// This is always 0 for the on-demand instance allocator and it's the
-    /// index of the slot in the pooling allocator.
-    index: usize,
 
     /// A pointer to the `vmctx` field at the end of the `Instance`.
     ///
@@ -140,6 +143,10 @@ pub struct Instance {
     /// seems not too bad.
     vmctx_self_reference: SendSyncPtr<VMContext>,
 
+    #[cfg(feature = "wmemcheck")]
+    pub(crate) wmemcheck_state: Option<Wmemcheck>,
+    // TODO: add support for multiple memories, wmemcheck_state corresponds to
+    // memory 0.
     /// Additional context used by compiled wasm code. This field is last, and
     /// represents a dynamically-sized array that extends beyond the nominal
     /// end of the struct (similar to a flexible array member).
@@ -154,9 +161,9 @@ impl Instance {
     /// allocation was `alloc_size` in bytes.
     unsafe fn new(
         req: InstanceAllocationRequest,
-        index: usize,
-        memories: PrimaryMap<DefinedMemoryIndex, Memory>,
-        tables: PrimaryMap<DefinedTableIndex, Table>,
+        memories: PrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)>,
+        tables: PrimaryMap<DefinedTableIndex, (TableAllocationIndex, Table)>,
+        memory_plans: &PrimaryMap<MemoryIndex, MemoryPlan>,
     ) -> InstanceHandle {
         // The allocation must be *at least* the size required of `Instance`.
         let layout = Self::alloc_layout(req.runtime_info.offsets());
@@ -170,11 +177,13 @@ impl Instance {
         let dropped_elements = EntitySet::with_capacity(module.passive_elements.len());
         let dropped_data = EntitySet::with_capacity(module.passive_data_map.len());
 
+        #[cfg(not(feature = "wmemcheck"))]
+        let _ = memory_plans;
+
         ptr::write(
             ptr,
             Instance {
                 runtime_info: req.runtime_info.clone(),
-                index,
                 memories,
                 tables,
                 dropped_elements,
@@ -185,6 +194,21 @@ impl Instance {
                 ),
                 vmctx: VMContext {
                     _marker: std::marker::PhantomPinned,
+                },
+                #[cfg(feature = "wmemcheck")]
+                wmemcheck_state: {
+                    if req.wmemcheck {
+                        let size = memory_plans
+                            .iter()
+                            .next()
+                            .map(|plan| plan.1.memory.minimum)
+                            .unwrap_or(0)
+                            * 64
+                            * 1024;
+                        Some(Wmemcheck::new(size as usize))
+                    } else {
+                        None
+                    }
                 },
             },
         );
@@ -542,7 +566,7 @@ impl Instance {
         delta: u64,
     ) -> Result<Option<usize>, Error> {
         let store = unsafe { &mut *self.store() };
-        let memory = &mut self.memories[idx];
+        let memory = &mut self.memories[idx].1;
 
         let result = unsafe { memory.grow(delta, Some(store)) };
 
@@ -583,16 +607,17 @@ impl Instance {
         init_value: TableElement,
     ) -> Result<Option<u32>, Error> {
         let store = unsafe { &mut *self.store() };
-        let table = self
+        let table = &mut self
             .tables
             .get_mut(table_index)
-            .unwrap_or_else(|| panic!("no table for index {}", table_index.index()));
+            .unwrap_or_else(|| panic!("no table for index {}", table_index.index()))
+            .1;
 
         let result = unsafe { table.grow(delta, init_value, store) };
 
         // Keep the `VMContext` pointers used by compiled Wasm code up to
         // date.
-        let element = self.tables[table_index].vmtable();
+        let element = self.tables[table_index].1.vmtable();
         self.set_table(table_index, element);
 
         result
@@ -781,7 +806,7 @@ impl Instance {
 
     /// Get a locally-defined memory.
     pub fn get_defined_memory(&mut self, index: DefinedMemoryIndex) -> *mut Memory {
-        ptr::addr_of_mut!(self.memories[index])
+        ptr::addr_of_mut!(self.memories[index].1)
     }
 
     /// Do a `memory.copy`
@@ -950,11 +975,11 @@ impl Instance {
         idx: DefinedTableIndex,
         range: impl Iterator<Item = u32>,
     ) -> *mut Table {
-        let elt_ty = self.tables[idx].element_type();
+        let elt_ty = self.tables[idx].1.element_type();
 
         if elt_ty == TableElementType::Func {
             for i in range {
-                let value = match self.tables[idx].get(i) {
+                let value = match self.tables[idx].1.get(i) {
                     Some(value) => value,
                     None => {
                         // Out-of-bounds; caller will handle by likely
@@ -963,54 +988,48 @@ impl Instance {
                         break;
                     }
                 };
-                if value.is_uninit() {
-                    let module = self.module();
-                    let table_init = match &self.module().table_initialization {
-                        // We unfortunately can't borrow `tables` outside the
-                        // loop because we need to call `get_func_ref` (a `&mut`
-                        // method) below; so unwrap it dynamically here.
-                        TableInitialization::FuncTable { tables, .. } => tables,
-                        _ => break,
-                    }
-                    .get(module.table_index(idx));
 
-                    // The TableInitialization::FuncTable elements table may
-                    // be smaller than the current size of the table: it
-                    // always matches the initial table size, if present. We
-                    // want to iterate up through the end of the accessed
-                    // index range so that we set an "initialized null" even
-                    // if there is no initializer. We do a checked `get()` on
-                    // the initializer table below and unwrap to a null if
-                    // we're past its end.
-                    let func_index =
-                        table_init.and_then(|indices| indices.get(i as usize).cloned());
-                    let func_ref = func_index
-                        .and_then(|func_index| self.get_func_ref(func_index))
-                        .unwrap_or(std::ptr::null_mut());
-
-                    let value = TableElement::FuncRef(func_ref);
-
-                    self.tables[idx]
-                        .set(i, value)
-                        .expect("Table type should match and index should be in-bounds");
+                if !value.is_uninit() {
+                    continue;
                 }
+
+                // The table element `i` is uninitialized and is now being
+                // initialized. This must imply that a `precompiled` list of
+                // function indices is available for this table. The precompiled
+                // list is extracted and then it is consulted with `i` to
+                // determine the function that is going to be initialized. Note
+                // that `i` may be outside the limits of the static
+                // initialization so it's a fallible `get` instead of an index.
+                let module = self.module();
+                let precomputed = match &module.table_initialization.initial_values[idx] {
+                    TableInitialValue::Null { precomputed } => precomputed,
+                    TableInitialValue::FuncRef(_) => unreachable!(),
+                };
+                let func_index = precomputed.get(i as usize).cloned();
+                let func_ref = func_index
+                    .and_then(|func_index| self.get_func_ref(func_index))
+                    .unwrap_or(std::ptr::null_mut());
+                self.tables[idx]
+                    .1
+                    .set(i, TableElement::FuncRef(func_ref))
+                    .expect("Table type should match and index should be in-bounds");
             }
         }
 
-        ptr::addr_of_mut!(self.tables[idx])
+        ptr::addr_of_mut!(self.tables[idx].1)
     }
 
     /// Get a table by index regardless of whether it is locally-defined or an
     /// imported, foreign table.
     pub(crate) fn get_table(&mut self, table_index: TableIndex) -> *mut Table {
         self.with_defined_table_index_and_instance(table_index, |idx, instance| {
-            ptr::addr_of_mut!(instance.tables[idx])
+            ptr::addr_of_mut!(instance.tables[idx].1)
         })
     }
 
     /// Get a locally-defined table.
     pub(crate) fn get_defined_table(&mut self, index: DefinedTableIndex) -> *mut Table {
-        ptr::addr_of_mut!(self.tables[index])
+        ptr::addr_of_mut!(self.tables[index].1)
     }
 
     pub(crate) fn with_defined_table_index_and_instance<R>(
@@ -1092,7 +1111,7 @@ impl Instance {
         // Initialize the defined tables
         let mut ptr = self.vmctx_plus_offset_mut(offsets.vmctx_tables_begin());
         for i in 0..module.table_plans.len() - module.num_imported_tables {
-            ptr::write(ptr, self.tables[DefinedTableIndex::new(i)].vmtable());
+            ptr::write(ptr, self.tables[DefinedTableIndex::new(i)].1.vmtable());
             ptr = ptr.add(1);
         }
 
@@ -1108,12 +1127,13 @@ impl Instance {
             let memory_index = module.memory_index(defined_memory_index);
             if module.memory_plans[memory_index].memory.shared {
                 let def_ptr = self.memories[defined_memory_index]
+                    .1
                     .as_shared_memory()
                     .unwrap()
                     .vmmemory_ptr();
                 ptr::write(ptr, def_ptr.cast_mut());
             } else {
-                ptr::write(owned_ptr, self.memories[defined_memory_index].vmmemory());
+                ptr::write(owned_ptr, self.memories[defined_memory_index].1.vmmemory());
                 ptr::write(ptr, owned_ptr);
                 owned_ptr = owned_ptr.add(1);
             }
@@ -1133,7 +1153,18 @@ impl Instance {
             ptr::write(to, VMGlobalDefinition::new());
 
             match *init {
-                GlobalInit::I32Const(x) => *(*to).as_i32_mut() = x,
+                GlobalInit::I32Const(x) => {
+                    let index = module.global_index(index);
+                    if index.index() == 0 {
+                        #[cfg(feature = "wmemcheck")]
+                        {
+                            if let Some(wmemcheck) = &mut self.wmemcheck_state {
+                                wmemcheck.set_stack_size(x as usize);
+                            }
+                        }
+                    }
+                    *(*to).as_i32_mut() = x;
+                }
                 GlobalInit::I64Const(x) => *(*to).as_i64_mut() = x,
                 GlobalInit::F32Const(x) => *(*to).as_f32_bits_mut() = x,
                 GlobalInit::F64Const(x) => *(*to).as_f64_bits_mut() = x,
@@ -1148,9 +1179,10 @@ impl Instance {
                     // count as values move between globals, everything else is just
                     // copy-able bits.
                     match wasm_ty {
-                        WasmType::ExternRef => {
-                            *(*to).as_externref_mut() = from.as_externref().clone()
-                        }
+                        WasmType::Ref(WasmRefType {
+                            heap_type: WasmHeapType::Extern,
+                            ..
+                        }) => *(*to).as_externref_mut() = from.as_externref().clone(),
                         _ => ptr::copy_nonoverlapping(from, to, 1),
                     }
                 }
@@ -1159,8 +1191,7 @@ impl Instance {
                 }
                 GlobalInit::RefNullConst => match wasm_ty {
                     // `VMGlobalDefinition::new()` already zeroed out the bits
-                    WasmType::FuncRef => {}
-                    WasmType::ExternRef => {}
+                    WasmType::Ref(WasmRefType { nullable: true, .. }) => {}
                     ty => panic!("unsupported reference type for global: {:?}", ty),
                 },
             }
@@ -1169,7 +1200,7 @@ impl Instance {
 
     fn wasm_fault(&self, addr: usize) -> Option<WasmFault> {
         let mut fault = None;
-        for (_, memory) in self.memories.iter() {
+        for (_, (_, memory)) in self.memories.iter() {
             let accessible = memory.wasm_accessible();
             if accessible.start <= addr && addr < accessible.end {
                 // All linear memories should be disjoint so assert that no
@@ -1196,7 +1227,10 @@ impl Drop for Instance {
             };
             match global.wasm_ty {
                 // For now only externref globals need to get destroyed
-                WasmType::ExternRef => {}
+                WasmType::Ref(WasmRefType {
+                    heap_type: WasmHeapType::Extern,
+                    ..
+                }) => {}
                 _ => continue,
             }
             unsafe {

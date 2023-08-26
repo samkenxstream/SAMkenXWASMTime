@@ -44,6 +44,11 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn i32_as_i64(&mut self, x: i32) -> i64 {
+            x.into()
+        }
+
+        #[inline]
         fn i64_neg(&mut self, x: i64) -> i64 {
             x.wrapping_neg()
         }
@@ -225,6 +230,21 @@ macro_rules! isle_common_prelude_methods {
                 .checked_sub(ty_bits.into())
                 .expect("unimplemented for > 64 bits");
             u64::MAX >> shift
+        }
+
+        #[inline]
+        fn ty_lane_mask(&mut self, ty: Type) -> u64 {
+            let ty_lane_count = ty.lane_count();
+            debug_assert_ne!(ty_lane_count, 0);
+            let shift = 64_u64
+                .checked_sub(ty_lane_count.into())
+                .expect("unimplemented for > 64 bits");
+            u64::MAX >> shift
+        }
+
+        #[inline]
+        fn ty_lane_count(&mut self, ty: Type) -> u64 {
+            ty.lane_count() as u64
         }
 
         #[inline]
@@ -632,10 +652,8 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn s32_add_fallible(&mut self, a: u32, b: u32) -> Option<u32> {
-            let a = a as i32;
-            let b = b as i32;
-            a.checked_add(b).map(|sum| sum as u32)
+        fn s32_add_fallible(&mut self, a: i32, b: i32) -> Option<i32> {
+            a.checked_add(b)
         }
 
         #[inline]
@@ -685,10 +703,8 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn simm32(&mut self, x: Imm64) -> Option<u32> {
-            let x64: i64 = x.into();
-            let x32: i32 = x64.try_into().ok()?;
-            Some(x32 as u32)
+        fn simm32(&mut self, x: Imm64) -> Option<i32> {
+            i64::from(x).try_into().ok()
         }
 
         #[inline]
@@ -699,9 +715,8 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn offset32(&mut self, x: Offset32) -> u32 {
-            let x: i32 = x.into();
-            x as u32
+        fn offset32(&mut self, x: Offset32) -> i32 {
+            x.into()
         }
 
         #[inline]
@@ -725,14 +740,40 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn offset32_to_u32(&mut self, offset: Offset32) -> u32 {
-            let offset: i32 = offset.into();
-            offset as u32
+        fn ty_half_lanes(&mut self, ty: Type) -> Option<Type> {
+            if ty.lane_count() == 1 {
+                None
+            } else {
+                ty.lane_type().by(ty.lane_count() / 2)
+            }
         }
 
         #[inline]
-        fn u32_to_offset32(&mut self, offset: u32) -> Offset32 {
-            Offset32::new(offset as i32)
+        fn ty_half_width(&mut self, ty: Type) -> Option<Type> {
+            let new_lane = match ty.lane_type() {
+                I16 => I8,
+                I32 => I16,
+                I64 => I32,
+                F64 => F32,
+                _ => return None,
+            };
+
+            new_lane.by(ty.lane_count())
+        }
+
+        #[inline]
+        fn ty_equal(&mut self, lhs: Type, rhs: Type) -> bool {
+            lhs == rhs
+        }
+
+        #[inline]
+        fn offset32_to_i32(&mut self, offset: Offset32) -> i32 {
+            offset.into()
+        }
+
+        #[inline]
+        fn i32_to_offset32(&mut self, offset: i32) -> Offset32 {
+            Offset32::new(offset)
         }
 
         fn range(&mut self, start: usize, end: usize) -> Range {
@@ -777,23 +818,23 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
-        fn intcc_reverse(&mut self, cc: &IntCC) -> IntCC {
-            cc.reverse()
+        fn intcc_swap_args(&mut self, cc: &IntCC) -> IntCC {
+            cc.swap_args()
         }
 
         #[inline]
-        fn intcc_inverse(&mut self, cc: &IntCC) -> IntCC {
-            cc.inverse()
+        fn intcc_complement(&mut self, cc: &IntCC) -> IntCC {
+            cc.complement()
         }
 
         #[inline]
-        fn floatcc_reverse(&mut self, cc: &FloatCC) -> FloatCC {
-            cc.reverse()
+        fn floatcc_swap_args(&mut self, cc: &FloatCC) -> FloatCC {
+            cc.swap_args()
         }
 
         #[inline]
-        fn floatcc_inverse(&mut self, cc: &FloatCC) -> FloatCC {
-            cc.inverse()
+        fn floatcc_complement(&mut self, cc: &FloatCC) -> FloatCC {
+            cc.complement()
         }
 
         fn floatcc_unordered(&mut self, cc: &FloatCC) -> bool {

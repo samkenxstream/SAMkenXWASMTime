@@ -12,6 +12,7 @@ use crate::machinst::{PrettyPrint, Reg, RegClass, Writable};
 use alloc::vec::Vec;
 use regalloc2::{PRegSet, VReg};
 use smallvec::{smallvec, SmallVec};
+use std::fmt::Write;
 use std::string::{String, ToString};
 
 pub(crate) mod regs;
@@ -91,6 +92,10 @@ pub struct CallInfo {
     pub caller_callconv: CallConv,
     /// Callee calling convention.
     pub callee_callconv: CallConv,
+    /// The number of bytes that the callee will pop from the stack for the
+    /// caller, if any. (Used for popping stack arguments with the `tail`
+    /// calling convention.)
+    pub callee_pop_size: u32,
 }
 
 /// Additional information for CallInd instructions, left out of line to lower the size of the Inst
@@ -111,6 +116,28 @@ pub struct CallIndInfo {
     pub caller_callconv: CallConv,
     /// Callee calling convention.
     pub callee_callconv: CallConv,
+    /// The number of bytes that the callee will pop from the stack for the
+    /// caller, if any. (Used for popping stack arguments with the `tail`
+    /// calling convention.)
+    pub callee_pop_size: u32,
+}
+
+/// Additional information for `return_call[_ind]` instructions, left out of
+/// line to lower the size of the `Inst` enum.
+#[derive(Clone, Debug)]
+pub struct ReturnCallInfo {
+    /// Arguments to the call instruction.
+    pub uses: CallArgList,
+    /// Instruction opcode.
+    pub opcode: Opcode,
+    /// The size of the current/old stack frame's stack arguments.
+    pub old_stack_arg_size: u32,
+    /// The size of the new stack frame's stack arguments. This is necessary
+    /// for copying the frame over our current frame. It must already be
+    /// allocated on the stack.
+    pub new_stack_arg_size: u32,
+    /// API key to use to restore the return address, if any.
+    pub key: Option<APIKey>,
 }
 
 /// Additional information for JTSequence instructions, left out of line to lower the size of the Inst
@@ -385,10 +412,10 @@ fn pairmemarg_operands<F: Fn(VReg) -> VReg>(
 ) {
     // This should match `PairAMode::with_allocs()`.
     match pairmemarg {
-        &PairAMode::SignedOffset(reg, ..) => {
+        &PairAMode::SignedOffset { reg, .. } => {
             collector.reg_use(reg);
         }
-        &PairAMode::SPPreIndexed(..) | &PairAMode::SPPostIndexed(..) => {}
+        &PairAMode::SPPreIndexed { .. } | &PairAMode::SPPostIndexed { .. } => {}
     }
 }
 
@@ -833,7 +860,7 @@ fn aarch64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
                 collector.reg_fixed_def(arg.vreg, arg.preg);
             }
         }
-        &Inst::Ret { ref rets } | &Inst::AuthenticatedRet { ref rets, .. } => {
+        &Inst::Ret { ref rets, .. } | &Inst::AuthenticatedRet { ref rets, .. } => {
             for ret in rets {
                 collector.reg_fixed_use(ret.vreg, ret.preg);
             }
@@ -849,7 +876,13 @@ fn aarch64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
             collector.reg_clobbers(info.clobbers);
         }
         &Inst::CallInd { ref info, .. } => {
-            collector.reg_use(info.rn);
+            if info.callee_callconv == CallConv::Tail {
+                // TODO(https://github.com/bytecodealliance/regalloc2/issues/145):
+                // This shouldn't be a fixed register constraint.
+                collector.reg_fixed_use(info.rn, xreg(1));
+            } else {
+                collector.reg_use(info.rn);
+            }
             for u in &info.uses {
                 collector.reg_fixed_use(u.vreg, u.preg);
             }
@@ -857,6 +890,20 @@ fn aarch64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
                 collector.reg_fixed_def(d.vreg, d.preg);
             }
             collector.reg_clobbers(info.clobbers);
+        }
+        &Inst::ReturnCall {
+            ref info,
+            callee: _,
+        } => {
+            for u in &info.uses {
+                collector.reg_fixed_use(u.vreg, u.preg);
+            }
+        }
+        &Inst::ReturnCallInd { ref info, callee } => {
+            collector.reg_use(callee);
+            for u in &info.uses {
+                collector.reg_fixed_use(u.vreg, u.preg);
+            }
         }
         &Inst::CondBr { ref kind, .. } => match kind {
             CondBrKind::Zero(rt) | CondBrKind::NotZero(rt) => {
@@ -894,7 +941,7 @@ fn aarch64_get_operands<F: Fn(VReg) -> VReg>(inst: &Inst, collector: &mut Operan
             collector.reg_def(rd);
             memarg_operands(mem, collector);
         }
-        &Inst::Pacisp { .. } | &Inst::Xpaclri => {
+        &Inst::Paci { .. } | &Inst::Xpaclri => {
             // Neither LR nor SP is an allocatable register, so there is no need
             // to do anything.
         }
@@ -998,6 +1045,7 @@ impl MachInst for Inst {
     fn is_term(&self) -> MachTerminator {
         match self {
             &Inst::Ret { .. } | &Inst::AuthenticatedRet { .. } => MachTerminator::Ret,
+            &Inst::ReturnCall { .. } | &Inst::ReturnCallInd { .. } => MachTerminator::RetCall,
             &Inst::Jump { .. } => MachTerminator::Uncond,
             &Inst::CondBr { .. } => MachTerminator::Cond,
             &Inst::IndirectBr { .. } => MachTerminator::Indirect,
@@ -2507,37 +2555,87 @@ impl Inst {
                 let rn = pretty_print_reg(info.rn, allocs);
                 format!("blr {}", rn)
             }
+            &Inst::ReturnCall {
+                ref callee,
+                ref info,
+            } => {
+                let mut s = format!(
+                    "return_call {callee:?} old_stack_arg_size:{} new_stack_arg_size:{}",
+                    info.old_stack_arg_size, info.new_stack_arg_size
+                );
+                for ret in &info.uses {
+                    let preg = pretty_print_reg(ret.preg, &mut empty_allocs);
+                    let vreg = pretty_print_reg(ret.vreg, allocs);
+                    write!(&mut s, " {vreg}={preg}").unwrap();
+                }
+                s
+            }
+            &Inst::ReturnCallInd { callee, ref info } => {
+                let callee = pretty_print_reg(callee, allocs);
+                let mut s = format!(
+                    "return_call_ind {callee} old_stack_arg_size:{} new_stack_arg_size:{}",
+                    info.old_stack_arg_size, info.new_stack_arg_size
+                );
+                for ret in &info.uses {
+                    let preg = pretty_print_reg(ret.preg, &mut empty_allocs);
+                    let vreg = pretty_print_reg(ret.vreg, allocs);
+                    write!(&mut s, " {vreg}={preg}").unwrap();
+                }
+                s
+            }
             &Inst::Args { ref args } => {
                 let mut s = "args".to_string();
                 for arg in args {
-                    use std::fmt::Write;
                     let preg = pretty_print_reg(arg.preg, &mut empty_allocs);
                     let def = pretty_print_reg(arg.vreg.to_reg(), allocs);
                     write!(&mut s, " {}={}", def, preg).unwrap();
                 }
                 s
             }
-            &Inst::Ret { ref rets } => {
-                let mut s = "ret".to_string();
+            &Inst::Ret {
+                ref rets,
+                stack_bytes_to_pop,
+            } => {
+                let mut s = if stack_bytes_to_pop == 0 {
+                    "ret".to_string()
+                } else {
+                    format!("add sp, sp, #{} ; ret", stack_bytes_to_pop)
+                };
                 for ret in rets {
-                    use std::fmt::Write;
                     let preg = pretty_print_reg(ret.preg, &mut empty_allocs);
                     let vreg = pretty_print_reg(ret.vreg, allocs);
-                    write!(&mut s, " {}={}", vreg, preg).unwrap();
+                    write!(&mut s, " {vreg}={preg}").unwrap();
                 }
                 s
             }
-            &Inst::AuthenticatedRet { key, is_hint, .. } => {
+            &Inst::AuthenticatedRet {
+                key,
+                is_hint,
+                stack_bytes_to_pop,
+                ref rets,
+            } => {
                 let key = match key {
-                    APIKey::A => "a",
-                    APIKey::B => "b",
+                    APIKey::AZ => "az",
+                    APIKey::BZ => "bz",
+                    APIKey::ASP => "asp",
+                    APIKey::BSP => "bsp",
                 };
-
-                if is_hint {
-                    "auti".to_string() + key + "sp ; ret"
-                } else {
-                    "reta".to_string() + key
+                let mut s = match (is_hint, stack_bytes_to_pop) {
+                    (false, 0) => format!("reta{key}"),
+                    (false, n) => {
+                        format!("add sp, sp, #{n} ; reta{key}")
+                    }
+                    (true, 0) => format!("auti{key} ; ret"),
+                    (true, n) => {
+                        format!("add sp, sp, #{n} ; auti{key} ; ret")
+                    }
+                };
+                for ret in rets {
+                    let preg = pretty_print_reg(ret.preg, &mut empty_allocs);
+                    let vreg = pretty_print_reg(ret.vreg, allocs);
+                    write!(&mut s, " {vreg}={preg}").unwrap();
                 }
+                s
             }
             &Inst::Jump { ref dest } => {
                 let dest = dest.pretty_print(0, allocs);
@@ -2720,13 +2818,15 @@ impl Inst {
                 }
                 ret
             }
-            &Inst::Pacisp { key } => {
+            &Inst::Paci { key } => {
                 let key = match key {
-                    APIKey::A => "a",
-                    APIKey::B => "b",
+                    APIKey::AZ => "az",
+                    APIKey::BZ => "bz",
+                    APIKey::ASP => "asp",
+                    APIKey::BSP => "bsp",
                 };
 
-                "paci".to_string() + key + "sp"
+                "paci".to_string() + key
             }
             &Inst::Xpaclri => "xpaclri".to_string(),
             &Inst::Bti { targets } => {
@@ -2882,6 +2982,10 @@ impl MachInstLabelUse for LabelUse {
             LabelUse::Branch26 => 20,
             _ => unreachable!(),
         }
+    }
+
+    fn worst_case_veneer_size() -> CodeOffset {
+        20
     }
 
     /// Generate a veneer into the buffer, given that this veneer is at `veneer_offset`, and return

@@ -4,7 +4,9 @@
 
 use alloc::{string::String, vec::Vec};
 use core::{fmt::Debug, hash::Hash};
-use regalloc2::{Allocation, Operand, OperandConstraint, PReg, PRegSet, VReg};
+use regalloc2::{
+    Allocation, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet, VReg,
+};
 
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
@@ -406,6 +408,20 @@ impl<'a, F: Fn(VReg) -> VReg> OperandCollector<'a, F> {
     }
 
     /// Add a register "fixed use", which ties a vreg to a particular
+    /// RealReg at the end of the instruction.
+    pub fn reg_fixed_late_use(&mut self, reg: Reg, rreg: Reg) {
+        debug_assert!(reg.is_virtual());
+        let rreg = rreg.to_real_reg().expect("fixed reg is not a RealReg");
+        debug_assert!(self.is_allocatable_preg(rreg.into()));
+        self.add_operand(Operand::new(
+            reg.into(),
+            OperandConstraint::FixedReg(rreg.into()),
+            OperandKind::Use,
+            OperandPos::Late,
+        ));
+    }
+
+    /// Add a register "fixed use", which ties a vreg to a particular
     /// RealReg at this point.
     pub fn reg_fixed_use(&mut self, reg: Reg, rreg: Reg) {
         debug_assert!(reg.is_virtual());
@@ -419,7 +435,10 @@ impl<'a, F: Fn(VReg) -> VReg> OperandCollector<'a, F> {
     pub fn reg_fixed_def(&mut self, reg: Writable<Reg>, rreg: Reg) {
         debug_assert!(reg.to_reg().is_virtual());
         let rreg = rreg.to_real_reg().expect("fixed reg is not a RealReg");
-        debug_assert!(self.is_allocatable_preg(rreg.into()));
+        debug_assert!(
+            self.is_allocatable_preg(rreg.into()),
+            "{rreg:?} is not allocatable"
+        );
         self.add_operand(Operand::reg_fixed_def(reg.to_reg().into(), rreg.into()));
     }
 

@@ -5,9 +5,9 @@ pub(crate) mod generated_code;
 use crate::{
     ir::types,
     ir::AtomicRmwOp,
+    isa, isle_common_prelude_methods, isle_lower_prelude_methods,
     machinst::{InputSourceInst, Reg, Writable},
 };
-use crate::{isle_common_prelude_methods, isle_lower_prelude_methods};
 use generated_code::{Context, MInst, RegisterClass};
 
 // Types that the generated ISLE code uses via `use super::*`.
@@ -26,7 +26,7 @@ use crate::{
         unwind::UnwindInst,
         x64::{
             abi::X64CallSite,
-            inst::{args::*, regs, CallInfo},
+            inst::{args::*, regs, CallInfo, ReturnCallInfo},
         },
     },
     machinst::{
@@ -41,6 +41,7 @@ use std::boxed::Box;
 use std::convert::TryFrom;
 
 type BoxCallInfo = Box<CallInfo>;
+type BoxReturnCallInfo = Box<ReturnCallInfo>;
 type BoxVecMachLabel = Box<SmallVec<[MachLabel; 4]>>;
 type MachLabelSlice = [MachLabel];
 type VecArgPair = Vec<ArgPair>;
@@ -78,6 +79,61 @@ pub(crate) fn lower_branch(
 impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     isle_lower_prelude_methods!();
     isle_prelude_caller_methods!(X64ABIMachineSpec, X64CallSite);
+
+    fn gen_return_call_indirect(
+        &mut self,
+        callee_sig: SigRef,
+        callee: Value,
+        args: ValueSlice,
+    ) -> InstOutput {
+        let caller_conv = isa::CallConv::Tail;
+        debug_assert_eq!(
+            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
+            caller_conv,
+            "Can only do `return_call`s from within a `tail` calling convention function"
+        );
+
+        let callee = self.put_in_reg(callee);
+
+        let call_site = X64CallSite::from_ptr(
+            self.lower_ctx.sigs(),
+            callee_sig,
+            callee,
+            Opcode::ReturnCallIndirect,
+            caller_conv,
+            self.backend.flags().clone(),
+        );
+        call_site.emit_return_call(self.lower_ctx, args);
+
+        InstOutput::new()
+    }
+
+    fn gen_return_call(
+        &mut self,
+        callee_sig: SigRef,
+        callee: ExternalName,
+        distance: RelocDistance,
+        args: ValueSlice,
+    ) -> InstOutput {
+        let caller_conv = isa::CallConv::Tail;
+        debug_assert_eq!(
+            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
+            caller_conv,
+            "Can only do `return_call`s from within a `tail` calling convention function"
+        );
+
+        let call_site = X64CallSite::from_func(
+            self.lower_ctx.sigs(),
+            callee_sig,
+            &callee,
+            distance,
+            caller_conv,
+            self.backend.flags().clone(),
+        );
+        call_site.emit_return_call(self.lower_ctx, args);
+
+        InstOutput::new()
+    }
 
     #[inline]
     fn operand_size_of_type_32_64(&mut self, ty: Type) -> OperandSize {
@@ -170,38 +226,38 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
-    fn use_avx_simd(&mut self) -> bool {
-        self.backend.x64_flags.use_avx_simd()
+    fn use_avx(&mut self) -> bool {
+        self.backend.x64_flags.use_avx()
     }
 
     #[inline]
-    fn use_avx2_simd(&mut self) -> bool {
-        self.backend.x64_flags.use_avx2_simd()
+    fn use_avx2(&mut self) -> bool {
+        self.backend.x64_flags.use_avx2()
     }
 
     #[inline]
-    fn use_avx512vl_simd(&mut self) -> bool {
-        self.backend.x64_flags.use_avx512vl_simd()
+    fn use_avx512vl(&mut self) -> bool {
+        self.backend.x64_flags.use_avx512vl()
     }
 
     #[inline]
-    fn use_avx512dq_simd(&mut self) -> bool {
-        self.backend.x64_flags.use_avx512dq_simd()
+    fn use_avx512dq(&mut self) -> bool {
+        self.backend.x64_flags.use_avx512dq()
     }
 
     #[inline]
-    fn use_avx512f_simd(&mut self) -> bool {
-        self.backend.x64_flags.use_avx512f_simd()
+    fn use_avx512f(&mut self) -> bool {
+        self.backend.x64_flags.use_avx512f()
     }
 
     #[inline]
-    fn use_avx512bitalg_simd(&mut self) -> bool {
-        self.backend.x64_flags.use_avx512bitalg_simd()
+    fn use_avx512bitalg(&mut self) -> bool {
+        self.backend.x64_flags.use_avx512bitalg()
     }
 
     #[inline]
-    fn use_avx512vbmi_simd(&mut self) -> bool {
-        self.backend.x64_flags.use_avx512vbmi_simd()
+    fn use_avx512vbmi(&mut self) -> bool {
+        self.backend.x64_flags.use_avx512vbmi()
     }
 
     #[inline]
@@ -222,6 +278,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn use_fma(&mut self) -> bool {
         self.backend.x64_flags.use_fma()
+    }
+
+    #[inline]
+    fn use_ssse3(&mut self) -> bool {
+        self.backend.x64_flags.use_ssse3()
     }
 
     #[inline]
@@ -252,14 +313,14 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
-    fn shift_mask(&mut self, ty: Type) -> u32 {
+    fn shift_mask(&mut self, ty: Type) -> u8 {
         debug_assert!(ty.lane_bits().is_power_of_two());
 
-        ty.lane_bits() - 1
+        (ty.lane_bits() - 1) as u8
     }
 
-    fn shift_amount_masked(&mut self, ty: Type, val: Imm64) -> u32 {
-        (val.bits() as u32) & self.shift_mask(ty)
+    fn shift_amount_masked(&mut self, ty: Type, val: Imm64) -> u8 {
+        (val.bits() as u8) & self.shift_mask(ty)
     }
 
     #[inline]
@@ -399,16 +460,6 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         SyntheticAmode::ConstantOffset(mask_table)
     }
 
-    fn popcount_4bit_table(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&POPCOUNT_4BIT_TABLE))
-    }
-
-    fn popcount_low_mask(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&POPCOUNT_LOW_MASK))
-    }
-
     #[inline]
     fn writable_reg_to_xmm(&mut self, r: WritableReg) -> WritableXmm {
         Writable::from_reg(Xmm::new(r.to_reg()).unwrap())
@@ -446,12 +497,12 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
 
     #[inline]
     fn temp_writable_gpr(&mut self) -> WritableGpr {
-        Writable::from_reg(Gpr::new(self.temp_writable_reg(I64).to_reg()).unwrap())
+        self.lower_ctx.temp_writable_gpr()
     }
 
     #[inline]
     fn temp_writable_xmm(&mut self) -> WritableXmm {
-        Writable::from_reg(Xmm::new(self.temp_writable_reg(I8X16).to_reg()).unwrap())
+        self.lower_ctx.temp_writable_xmm()
     }
 
     #[inline]
@@ -603,7 +654,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
-    fn amode_offset(&mut self, addr: &Amode, offset: u32) -> Amode {
+    fn amode_offset(&mut self, addr: &Amode, offset: i32) -> Amode {
         addr.offset(offset)
     }
 
@@ -643,6 +694,24 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
             &self.backend.triple,
             libcall.clone(),
             &[a],
+            &[output_reg],
+        )
+        .expect("Failed to emit LibCall");
+
+        output_reg.to_reg()
+    }
+
+    fn libcall_2(&mut self, libcall: &LibCall, a: Reg, b: Reg) -> Reg {
+        let call_conv = self.lower_ctx.abi().call_conv(self.lower_ctx.sigs());
+        let ret_ty = libcall.signature(call_conv, I64).returns[0].value_type;
+        let output_reg = self.lower_ctx.alloc_tmp(ret_ty).only_reg().unwrap();
+
+        emit_vm_call(
+            self.lower_ctx,
+            &self.backend.flags,
+            &self.backend.triple,
+            libcall.clone(),
+            &[a, b],
             &[output_reg],
         )
         .expect("Failed to emit LibCall");
@@ -715,53 +784,6 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
-    fn fcvt_uint_mask_const(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&UINT_MASK))
-    }
-
-    #[inline]
-    fn fcvt_uint_mask_high_const(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&UINT_MASK_HIGH))
-    }
-
-    #[inline]
-    fn iadd_pairwise_mul_const_16(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&IADD_PAIRWISE_MUL_CONST_16))
-    }
-
-    #[inline]
-    fn iadd_pairwise_mul_const_32(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&IADD_PAIRWISE_MUL_CONST_32))
-    }
-
-    #[inline]
-    fn iadd_pairwise_xor_const_32(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&IADD_PAIRWISE_XOR_CONST_32))
-    }
-
-    #[inline]
-    fn iadd_pairwise_addd_const_32(&mut self) -> VCodeConstant {
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&IADD_PAIRWISE_ADDD_CONST_32))
-    }
-
-    #[inline]
-    fn snarrow_umax_mask(&mut self) -> VCodeConstant {
-        // 2147483647.0 is equivalent to 0x41DFFFFFFFC00000
-        static UMAX_MASK: [u8; 16] = [
-            0x00, 0x00, 0xC0, 0xFF, 0xFF, 0xFF, 0xDF, 0x41, 0x00, 0x00, 0xC0, 0xFF, 0xFF, 0xFF,
-            0xDF, 0x41,
-        ];
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&UMAX_MASK))
-    }
-
-    #[inline]
     fn shuffle_0_31_mask(&mut self, mask: &VecMask) -> VCodeConstant {
         let mask = mask
             .iter()
@@ -819,46 +841,6 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         let mask = mask.iter().cloned().collect();
         self.lower_ctx
             .use_constant(VCodeConstantData::Generated(mask))
-    }
-
-    #[inline]
-    fn swizzle_zero_mask(&mut self) -> VCodeConstant {
-        static ZERO_MASK_VALUE: [u8; 16] = [0x70; 16];
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&ZERO_MASK_VALUE))
-    }
-
-    #[inline]
-    fn sqmul_round_sat_mask(&mut self) -> VCodeConstant {
-        static SAT_MASK: [u8; 16] = [
-            0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80,
-            0x00, 0x80,
-        ];
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&SAT_MASK))
-    }
-
-    #[inline]
-    fn uunarrow_umax_mask(&mut self) -> VCodeConstant {
-        // 4294967295.0 is equivalent to 0x41EFFFFFFFE00000
-        static UMAX_MASK: [u8; 16] = [
-            0x00, 0x00, 0xE0, 0xFF, 0xFF, 0xFF, 0xEF, 0x41, 0x00, 0x00, 0xE0, 0xFF, 0xFF, 0xFF,
-            0xEF, 0x41,
-        ];
-
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&UMAX_MASK))
-    }
-
-    #[inline]
-    fn uunarrow_uint_mask(&mut self) -> VCodeConstant {
-        static UINT_MASK: [u8; 16] = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x30, 0x43,
-        ];
-
-        self.lower_ctx
-            .use_constant(VCodeConstantData::WellKnown(&UINT_MASK))
     }
 
     fn xmm_mem_to_xmm_mem_aligned(&mut self, arg: &XmmMem) -> XmmMemAligned {
@@ -1099,18 +1081,6 @@ const I8X16_USHR_MASKS: [u8; 128] = [
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
 ];
 
-/// Number of bits set in a given nibble (4-bit value). Used in the
-/// vector implementation of popcount.
-#[rustfmt::skip] // Preserve 4x4 layout.
-const POPCOUNT_4BIT_TABLE: [u8; 16] = [
-    0x00, 0x01, 0x01, 0x02,
-    0x01, 0x02, 0x02, 0x03,
-    0x01, 0x02, 0x02, 0x03,
-    0x02, 0x03, 0x03, 0x04,
-];
-
-const POPCOUNT_LOW_MASK: [u8; 16] = [0x0f; 16];
-
 #[inline]
 fn to_simm32(constant: i64) -> Option<GprMemImm> {
     if constant == ((constant << 32) >> 32) {
@@ -1124,25 +1094,3 @@ fn to_simm32(constant: i64) -> Option<GprMemImm> {
         None
     }
 }
-
-const UINT_MASK: [u8; 16] = [
-    0x00, 0x00, 0x30, 0x43, 0x00, 0x00, 0x30, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
-
-const UINT_MASK_HIGH: [u8; 16] = [
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x43,
-];
-
-const IADD_PAIRWISE_MUL_CONST_16: [u8; 16] = [0x01; 16];
-
-const IADD_PAIRWISE_MUL_CONST_32: [u8; 16] = [
-    0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00,
-];
-
-const IADD_PAIRWISE_XOR_CONST_32: [u8; 16] = [
-    0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80,
-];
-
-const IADD_PAIRWISE_ADDD_CONST_32: [u8; 16] = [
-    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
-];

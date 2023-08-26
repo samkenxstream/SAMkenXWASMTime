@@ -65,11 +65,13 @@ impl Default for CompilerContext {
 /// A compiler that compiles a WebAssembly module with Compiler, translating
 /// the Wasm to Compiler IR, optimizing it and then translating to assembly.
 pub(crate) struct Compiler {
+    tunables: Tunables,
     contexts: Mutex<Vec<CompilerContext>>,
     isa: OwnedTargetIsa,
     linkopts: LinkOptions,
     cache_store: Option<Arc<dyn CacheStore>>,
     clif_dir: Option<path::PathBuf>,
+    wmemcheck: bool,
 }
 
 impl Drop for Compiler {
@@ -102,17 +104,21 @@ impl Drop for Compiler {
 
 impl Compiler {
     pub(crate) fn new(
+        tunables: Tunables,
         isa: OwnedTargetIsa,
         cache_store: Option<Arc<dyn CacheStore>>,
         linkopts: LinkOptions,
         clif_dir: Option<path::PathBuf>,
+        wmemcheck: bool,
     ) -> Compiler {
         Compiler {
             contexts: Default::default(),
+            tunables,
             isa,
             linkopts,
             cache_store,
             clif_dir,
+            wmemcheck,
         }
     }
 }
@@ -123,7 +129,6 @@ impl wasmtime_environ::Compiler for Compiler {
         translation: &ModuleTranslation<'_>,
         func_index: DefinedFuncIndex,
         input: FunctionBodyData<'_>,
-        tunables: &Tunables,
         types: &ModuleTypes,
     ) -> Result<(WasmFunctionInfo, Box<dyn Any + Send>), CompileError> {
         let isa = &*self.isa;
@@ -135,17 +140,18 @@ impl wasmtime_environ::Compiler for Compiler {
         let mut compiler = self.function_compiler();
 
         let context = &mut compiler.cx.codegen_context;
-        context.func.signature = wasm_call_signature(isa, wasm_func_ty);
+        context.func.signature = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
         context.func.name = UserFuncName::User(UserExternalName {
             namespace: 0,
             index: func_index.as_u32(),
         });
 
-        if tunables.generate_native_debuginfo {
+        if self.tunables.generate_native_debuginfo {
             context.func.collect_debug_info();
         }
 
-        let mut func_env = FuncEnvironment::new(isa, translation, types, tunables);
+        let mut func_env =
+            FuncEnvironment::new(isa, translation, types, &self.tunables, self.wmemcheck);
 
         // The `stack_limit` global value below is the implementation of stack
         // overflow checks in Wasmtime.
@@ -220,7 +226,7 @@ impl wasmtime_environ::Compiler for Compiler {
             write!(output, "{}", context.func.display()).unwrap();
         }
 
-        let (info, func) = compiler.finish_with_info(Some((&body, tunables)))?;
+        let (info, func) = compiler.finish_with_info(Some((&body, &self.tunables)))?;
 
         let timing = cranelift_codegen::timing::take_current();
         log::debug!("{:?} translated in {:?}", func_index, timing.total());
@@ -241,7 +247,7 @@ impl wasmtime_environ::Compiler for Compiler {
 
         let isa = &*self.isa;
         let pointer_type = isa.pointer_type();
-        let wasm_call_sig = wasm_call_signature(isa, wasm_func_ty);
+        let wasm_call_sig = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
         let array_call_sig = array_call_signature(isa);
 
         let mut compiler = self.function_compiler();
@@ -310,7 +316,7 @@ impl wasmtime_environ::Compiler for Compiler {
         let isa = &*self.isa;
         let pointer_type = isa.pointer_type();
         let func_index = translation.module.func_index(def_func_index);
-        let wasm_call_sig = wasm_call_signature(isa, wasm_func_ty);
+        let wasm_call_sig = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
         let native_call_sig = native_call_signature(isa, wasm_func_ty);
 
         let mut compiler = self.function_compiler();
@@ -335,12 +341,15 @@ impl wasmtime_environ::Compiler for Compiler {
             vmctx,
         );
 
+        let ret = NativeRet::classify(pointer_type, wasm_func_ty);
+        let wasm_args = ret.native_args(&args);
+
         // Then call into Wasm.
-        let call = declare_and_call(&mut builder, wasm_call_sig, func_index.as_u32(), &args);
+        let call = declare_and_call(&mut builder, wasm_call_sig, func_index.as_u32(), wasm_args);
 
         // Forward the results along.
         let results = builder.func.dfg.inst_results(call).to_vec();
-        builder.ins().return_(&results);
+        ret.native_return(&mut builder, block0, &results);
         builder.finalize();
 
         Ok(Box::new(compiler.finish()?))
@@ -348,21 +357,22 @@ impl wasmtime_environ::Compiler for Compiler {
 
     fn compile_wasm_to_native_trampoline(
         &self,
-        translation: &ModuleTranslation,
         wasm_func_ty: &WasmFuncType,
     ) -> Result<Box<dyn Any + Send>, CompileError> {
         let isa = &*self.isa;
         let pointer_type = isa.pointer_type();
-        let wasm_call_sig = wasm_call_signature(isa, wasm_func_ty);
+        let wasm_call_sig = wasm_call_signature(isa, wasm_func_ty, &self.tunables);
         let native_call_sig = native_call_signature(isa, wasm_func_ty);
 
         let mut compiler = self.function_compiler();
         let func = ir::Function::with_name_signature(Default::default(), wasm_call_sig);
         let (mut builder, block0) = compiler.builder(func);
 
-        let args = builder.func.dfg.block_params(block0).to_vec();
+        let mut args = builder.func.dfg.block_params(block0).to_vec();
         let callee_vmctx = args[0];
         let caller_vmctx = args[1];
+
+        let ret = NativeRet::classify(pointer_type, wasm_func_ty);
 
         // We are exiting Wasm, so save our PC and FP.
         //
@@ -374,14 +384,27 @@ impl wasmtime_environ::Compiler for Compiler {
             caller_vmctx,
             wasmtime_environ::VMCONTEXT_MAGIC,
         );
-        let offsets = VMOffsets::new(isa.pointer_bytes(), &translation.module);
+        let ptr = isa.pointer_bytes();
         let limits = builder.ins().load(
             pointer_type,
             MemFlags::trusted(),
             caller_vmctx,
-            i32::try_from(offsets.vmctx_runtime_limits()).unwrap(),
+            i32::try_from(ptr.vmcontext_runtime_limits()).unwrap(),
         );
-        save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &offsets.ptr, limits);
+        save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &ptr, limits);
+
+        // If the native call signature for this function uses a return pointer
+        // then allocate the return pointer here on the stack and pass it as the
+        // last argument.
+        let slot = match &ret {
+            NativeRet::Bare => None,
+            NativeRet::Retptr { size, .. } => Some(builder.func.create_sized_stack_slot(
+                ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, *size),
+            )),
+        };
+        if let Some(slot) = slot {
+            args.push(builder.ins().stack_addr(pointer_type, slot, 0));
+        }
 
         // Load the actual callee out of the
         // `VMNativeCallHostFuncContext::host_func`.
@@ -398,8 +421,22 @@ impl wasmtime_environ::Compiler for Compiler {
         let callee_signature = builder.func.import_signature(native_call_sig);
         let call = builder.ins().call_indirect(callee_signature, callee, &args);
 
-        // Forward the results back to the caller.
-        let results = builder.func.dfg.inst_results(call).to_vec();
+        // Forward the results back to the caller. If a return pointer was in
+        // use for the native call then load the results from the return pointer
+        // to pass through as native return values in the wasm abi.
+        let mut results = builder.func.dfg.inst_results(call).to_vec();
+        if let NativeRet::Retptr { offsets, .. } = ret {
+            let slot = *args.last().unwrap();
+            assert_eq!(offsets.len(), wasm_func_ty.returns().len() - 1);
+            for (ty, offset) in wasm_func_ty.returns()[1..].iter().zip(offsets) {
+                let ty = crate::value_type(isa, *ty);
+                results.push(
+                    builder
+                        .ins()
+                        .load(ty, MemFlags::trusted(), slot, offset as i32),
+                );
+            }
+        }
         builder.ins().return_(&results);
         builder.finalize();
 
@@ -410,7 +447,6 @@ impl wasmtime_environ::Compiler for Compiler {
         &self,
         obj: &mut Object<'static>,
         funcs: &[(String, Box<dyn Any + Send>)],
-        tunables: &Tunables,
         resolve_reloc: &dyn Fn(usize, FuncIndex) -> usize,
     ) -> Result<Vec<(SymbolId, FunctionLoc)>> {
         let mut builder =
@@ -427,7 +463,7 @@ impl wasmtime_environ::Compiler for Compiler {
                 .downcast_ref::<CompiledFunction<CompiledFuncEnv>>()
                 .unwrap();
             let (sym, range) = builder.append_func(&sym, func, |idx| resolve_reloc(i, idx));
-            if tunables.generate_address_map {
+            if self.tunables.generate_address_map {
                 let addr = func.address_map();
                 addrs.push(range.clone(), &addr.instructions);
             }
@@ -442,7 +478,7 @@ impl wasmtime_environ::Compiler for Compiler {
 
         builder.finish();
 
-        if tunables.generate_address_map {
+        if self.tunables.generate_address_map {
             addrs.append_to(obj);
         }
         traps.append_to(obj);
@@ -695,20 +731,18 @@ impl Compiler {
         let mut compiler = self.function_compiler();
         let func = ir::Function::with_name_signature(Default::default(), native_call_sig);
         let (mut builder, block0) = compiler.builder(func);
+        let args = builder.func.dfg.block_params(block0).to_vec();
+
+        let ret = NativeRet::classify(pointer_type, ty);
+        let wasm_args = &ret.native_args(&args)[2..];
 
         let (values_vec_ptr, values_vec_len) =
-            self.allocate_stack_array_and_spill_args(ty, &mut builder, block0);
+            self.allocate_stack_array_and_spill_args(ty, &mut builder, wasm_args);
         let values_vec_len = builder
             .ins()
             .iconst(pointer_type, i64::from(values_vec_len));
 
-        let block_params = builder.func.dfg.block_params(block0);
-        let callee_args = [
-            block_params[0],
-            block_params[1],
-            values_vec_ptr,
-            values_vec_len,
-        ];
+        let callee_args = [args[0], args[1], values_vec_ptr, values_vec_len];
 
         let new_sig = builder.import_signature(array_call_sig);
         let callee_value = builder.ins().iconst(pointer_type, host_fn as i64);
@@ -718,7 +752,7 @@ impl Compiler {
 
         let results =
             self.load_values_from_array(ty.returns(), &mut builder, values_vec_ptr, values_vec_len);
-        builder.ins().return_(&results);
+        ret.native_return(&mut builder, block0, &results);
         builder.finalize();
 
         compiler.finish()
@@ -754,13 +788,14 @@ impl Compiler {
     ) -> Result<CompiledFunction<CompiledFuncEnv>, CompileError> {
         let isa = &*self.isa;
         let pointer_type = isa.pointer_type();
-        let wasm_call_sig = wasm_call_signature(isa, ty);
+        let wasm_call_sig = wasm_call_signature(isa, ty, &self.tunables);
         let array_call_sig = array_call_signature(isa);
 
         let mut compiler = self.function_compiler();
         let func = ir::Function::with_name_signature(Default::default(), wasm_call_sig);
         let (mut builder, block0) = compiler.builder(func);
-        let caller_vmctx = builder.func.dfg.block_params(block0)[1];
+        let args = builder.func.dfg.block_params(block0).to_vec();
+        let caller_vmctx = args[1];
 
         // Assert that we were really given a core Wasm vmctx, since that's
         // what we are assuming with our offsets below.
@@ -780,7 +815,7 @@ impl Compiler {
         save_last_wasm_exit_fp_and_pc(&mut builder, pointer_type, &ptr_size, limits);
 
         let (values_vec_ptr, values_vec_len) =
-            self.allocate_stack_array_and_spill_args(ty, &mut builder, block0);
+            self.allocate_stack_array_and_spill_args(ty, &mut builder, &args[2..]);
         let values_vec_len = builder
             .ins()
             .iconst(pointer_type, i64::from(values_vec_len));
@@ -820,7 +855,7 @@ impl Compiler {
         &self,
         ty: &WasmFuncType,
         builder: &mut FunctionBuilder,
-        block0: ir::Block,
+        args: &[ir::Value],
     ) -> (Value, u32) {
         let isa = &*self.isa;
         let pointer_type = isa.pointer_type();
@@ -837,14 +872,11 @@ impl Compiler {
         ));
         let values_vec_ptr = builder.ins().stack_addr(pointer_type, slot, 0);
 
-        // NB: `2..` because the vmctx and caller vmctx don't go in the array.
-        let args = builder.func.dfg.block_params(block0)[2..].to_vec();
-
         {
             let values_vec_len = builder
                 .ins()
                 .iconst(ir::types::I32, i64::try_from(values_vec_len).unwrap());
-            self.store_values_to_array(builder, ty.params(), &args, values_vec_ptr, values_vec_len);
+            self.store_values_to_array(builder, ty.params(), args, values_vec_ptr, values_vec_len);
         }
 
         (values_vec_ptr, values_vec_len)
@@ -1197,4 +1229,73 @@ fn save_last_wasm_exit_fp_and_pc(
         limits,
         ptr.vmruntime_limits_last_wasm_exit_pc(),
     );
+}
+
+enum NativeRet {
+    Bare,
+    Retptr { offsets: Vec<u32>, size: u32 },
+}
+
+impl NativeRet {
+    fn classify(pointer_type: ir::Type, ty: &WasmFuncType) -> NativeRet {
+        fn align_to(val: u32, align: u32) -> u32 {
+            (val + (align - 1)) & !(align - 1)
+        }
+
+        match ty.returns() {
+            [] | [_] => NativeRet::Bare,
+            other => {
+                let mut offset = 0;
+                let mut offsets = Vec::new();
+                let mut max_align = 1;
+                for ty in other[1..].iter() {
+                    let size = match ty {
+                        WasmType::I32 | WasmType::F32 => 4,
+                        WasmType::I64 | WasmType::F64 => 8,
+                        WasmType::Ref(_) => pointer_type.bytes(),
+                        WasmType::V128 => 16,
+                    };
+                    offset = align_to(offset, size);
+                    offsets.push(offset);
+                    offset += size;
+                    max_align = max_align.max(size);
+                }
+                NativeRet::Retptr {
+                    offsets,
+                    size: align_to(offset, max_align),
+                }
+            }
+        }
+    }
+
+    fn native_args<'a>(&self, args: &'a [ir::Value]) -> &'a [ir::Value] {
+        match self {
+            NativeRet::Bare => args,
+            NativeRet::Retptr { .. } => &args[..args.len() - 1],
+        }
+    }
+
+    fn native_return(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        block0: ir::Block,
+        results: &[ir::Value],
+    ) {
+        match self {
+            NativeRet::Bare => {
+                builder.ins().return_(&results);
+            }
+            NativeRet::Retptr { offsets, .. } => {
+                let ptr = *builder.func.dfg.block_params(block0).last().unwrap();
+                let (first, rest) = results.split_first().unwrap();
+                assert_eq!(rest.len(), offsets.len());
+                for (arg, offset) in rest.iter().zip(offsets) {
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), *arg, ptr, *offset as i32);
+                }
+                builder.ins().return_(&[*first]);
+            }
+        }
+    }
 }

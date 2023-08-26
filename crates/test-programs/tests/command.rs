@@ -1,20 +1,15 @@
 use anyhow::Result;
-use cap_rand::RngCore;
 use cap_std::{ambient_authority, fs::Dir, time::Duration};
-use std::{
-    io::{Cursor, Write},
-    sync::Mutex,
-};
+use std::{io::Write, sync::Mutex};
 use wasmtime::{
     component::{Component, Linker},
     Config, Engine, Store,
 };
 use wasmtime_wasi::preview2::{
-    clocks::{WasiMonotonicClock, WasiWallClock},
-    pipe::ReadPipe,
-    wasi::command::add_to_linker,
-    wasi::command::Command,
-    DirPerms, FilePerms, Table, WasiCtx, WasiCtxBuilder, WasiView,
+    command::{add_to_linker, Command},
+    pipe::MemoryInputPipe,
+    DirPerms, FilePerms, HostMonotonicClock, HostWallClock, IsATTY, Table, WasiCtx, WasiCtxBuilder,
+    WasiView,
 };
 
 lazy_static::lazy_static! {
@@ -64,25 +59,26 @@ async fn instantiate(
     Ok((store, command))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn hello_stdout() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .set_args(&["gussie", "sparky", "willa"])
+        .args(&["gussie", "sparky", "willa"])
         .build(&mut table)?;
     let (mut store, command) =
         instantiate(get_component("hello_stdout"), CommandCtx { table, wasi }).await?;
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn panic() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .set_args(&[
+        .args(&[
             "diesel",
             "the",
             "cat",
@@ -95,65 +91,46 @@ async fn panic() -> Result<()> {
         .build(&mut table)?;
     let (mut store, command) =
         instantiate(get_component("panic"), CommandCtx { table, wasi }).await?;
-    let r = command.call_run(&mut store).await;
+    let r = command.wasi_cli_run().call_run(&mut store).await;
     assert!(r.is_err());
     println!("{:?}", r);
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn args() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .set_args(&["hello", "this", "", "is an argument", "with 🚩 emoji"])
+        .args(&["hello", "this", "", "is an argument", "with 🚩 emoji"])
         .build(&mut table)?;
     let (mut store, command) =
         instantiate(get_component("args"), CommandCtx { table, wasi }).await?;
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn random() -> Result<()> {
-    struct FakeRng;
-
-    impl RngCore for FakeRng {
-        fn next_u32(&mut self) -> u32 {
-            42
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            unimplemented!()
-        }
-
-        fn fill_bytes(&mut self, _dest: &mut [u8]) {
-            unimplemented!()
-        }
-
-        fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), cap_rand::Error> {
-            unimplemented!()
-        }
-    }
-
     let mut table = Table::new();
-    let mut wasi = WasiCtxBuilder::new().build(&mut table)?;
-    wasi.random = Box::new(FakeRng);
+    let wasi = WasiCtxBuilder::new().build(&mut table)?;
     let (mut store, command) =
         instantiate(get_component("random"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn time() -> Result<()> {
     struct FakeWallClock;
 
-    impl WasiWallClock for FakeWallClock {
+    impl HostWallClock for FakeWallClock {
         fn resolution(&self) -> Duration {
             Duration::from_secs(1)
         }
@@ -167,7 +144,7 @@ async fn time() -> Result<()> {
         now: Mutex<u64>,
     }
 
-    impl WasiMonotonicClock for FakeMonotonicClock {
+    impl HostMonotonicClock for FakeMonotonicClock {
         fn resolution(&self) -> u64 {
             1_000_000_000
         }
@@ -181,73 +158,80 @@ async fn time() -> Result<()> {
     }
 
     let mut table = Table::new();
-    let mut wasi = WasiCtxBuilder::new().build(&mut table)?;
-    wasi.clocks.wall = Box::new(FakeWallClock);
-    wasi.clocks.monotonic = Box::new(FakeMonotonicClock { now: Mutex::new(0) });
+    let wasi = WasiCtxBuilder::new()
+        .monotonic_clock(FakeMonotonicClock { now: Mutex::new(0) })
+        .wall_clock(FakeWallClock)
+        .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("time"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn stdin() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .set_stdin(ReadPipe::new(Cursor::new(
-            "So rested he by the Tumtum tree",
-        )))
+        .stdin(
+            MemoryInputPipe::new("So rested he by the Tumtum tree".into()),
+            IsATTY::No,
+        )
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("stdin"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn poll_stdin() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .set_stdin(ReadPipe::new(Cursor::new(
-            "So rested he by the Tumtum tree",
-        )))
+        .stdin(
+            MemoryInputPipe::new("So rested he by the Tumtum tree".into()),
+            IsATTY::No,
+        )
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("poll_stdin"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn env() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .push_env("frabjous", "day")
-        .push_env("callooh", "callay")
+        .env("frabjous", "day")
+        .env("callooh", "callay")
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("env"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn file_read() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -257,19 +241,20 @@ async fn file_read() -> Result<()> {
 
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .push_preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
+        .preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("file_read"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn file_append() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -280,12 +265,13 @@ async fn file_append() -> Result<()> {
 
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .push_preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
+        .preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("file_append"), CommandCtx { table, wasi }).await?;
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))?;
@@ -301,7 +287,7 @@ async fn file_append() -> Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn file_dir_sync() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -312,19 +298,20 @@ async fn file_dir_sync() -> Result<()> {
 
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .push_preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
+        .preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("file_dir_sync"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn exit_success() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new().build(&mut table)?;
@@ -332,7 +319,7 @@ async fn exit_success() -> Result<()> {
     let (mut store, command) =
         instantiate(get_component("exit_success"), CommandCtx { table, wasi }).await?;
 
-    let r = command.call_run(&mut store).await;
+    let r = command.wasi_cli_run().call_run(&mut store).await;
     let err = r.unwrap_err();
     let status = err
         .downcast_ref::<wasmtime_wasi::preview2::I32Exit>()
@@ -341,7 +328,7 @@ async fn exit_success() -> Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn exit_default() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new().build(&mut table)?;
@@ -349,12 +336,12 @@ async fn exit_default() -> Result<()> {
     let (mut store, command) =
         instantiate(get_component("exit_default"), CommandCtx { table, wasi }).await?;
 
-    let r = command.call_run(&mut store).await?;
+    let r = command.wasi_cli_run().call_run(&mut store).await?;
     assert!(r.is_ok());
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn exit_failure() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new().build(&mut table)?;
@@ -362,7 +349,7 @@ async fn exit_failure() -> Result<()> {
     let (mut store, command) =
         instantiate(get_component("exit_failure"), CommandCtx { table, wasi }).await?;
 
-    let r = command.call_run(&mut store).await;
+    let r = command.wasi_cli_run().call_run(&mut store).await;
     let err = r.unwrap_err();
     let status = err
         .downcast_ref::<wasmtime_wasi::preview2::I32Exit>()
@@ -371,7 +358,7 @@ async fn exit_failure() -> Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn exit_panic() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new().build(&mut table)?;
@@ -379,7 +366,7 @@ async fn exit_panic() -> Result<()> {
     let (mut store, command) =
         instantiate(get_component("exit_panic"), CommandCtx { table, wasi }).await?;
 
-    let r = command.call_run(&mut store).await;
+    let r = command.wasi_cli_run().call_run(&mut store).await;
     let err = r.unwrap_err();
     // The panic should trap.
     assert!(err
@@ -388,7 +375,7 @@ async fn exit_panic() -> Result<()> {
     Ok(())
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn directory_list() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -403,20 +390,22 @@ async fn directory_list() -> Result<()> {
 
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new()
-        .inherit_stdio()
-        .push_preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
+        .inherit_stdout()
+        .inherit_stderr()
+        .preopened_dir(open_dir, DirPerms::all(), FilePerms::all(), "/")
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("directory_list"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn default_clocks() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new().build(&mut table)?;
@@ -425,12 +414,13 @@ async fn default_clocks() -> Result<()> {
         instantiate(get_component("default_clocks"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn export_cabi_realloc() -> Result<()> {
     let mut table = Table::new();
     let wasi = WasiCtxBuilder::new().build(&mut table)?;
@@ -441,12 +431,13 @@ async fn export_cabi_realloc() -> Result<()> {
     .await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
 }
 
-#[test_log::test(tokio::test)]
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn read_only() -> Result<()> {
     let dir = tempfile::tempdir()?;
 
@@ -456,14 +447,64 @@ async fn read_only() -> Result<()> {
     let mut table = Table::new();
     let open_dir = Dir::open_ambient_dir(dir.path(), ambient_authority())?;
     let wasi = WasiCtxBuilder::new()
-        .push_preopened_dir(open_dir, DirPerms::READ, FilePerms::READ, "/")
+        .preopened_dir(open_dir, DirPerms::READ, FilePerms::READ, "/")
         .build(&mut table)?;
 
     let (mut store, command) =
         instantiate(get_component("read_only"), CommandCtx { table, wasi }).await?;
 
     command
+        .wasi_cli_run()
         .call_run(&mut store)
         .await?
         .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn stream_pollable_lifetimes() -> Result<()> {
+    // Test program has two modes, dispatching based on argument.
+    {
+        // Correct execution: should succeed
+        let mut table = Table::new();
+        let wasi = WasiCtxBuilder::new()
+            .args(&["correct"])
+            .stdin(MemoryInputPipe::new(" ".into()), IsATTY::No)
+            .build(&mut table)?;
+
+        let (mut store, command) = instantiate(
+            get_component("stream_pollable_lifetimes"),
+            CommandCtx { table, wasi },
+        )
+        .await?;
+
+        command
+            .wasi_cli_run()
+            .call_run(&mut store)
+            .await?
+            .map_err(|()| anyhow::anyhow!("command returned with failing exit status"))?;
+    }
+    {
+        // Incorrect execution: should trap with a TableError::HasChildren
+        let mut table = Table::new();
+        let wasi = WasiCtxBuilder::new()
+            .args(&["trap"])
+            .stdin(MemoryInputPipe::new(" ".into()), IsATTY::No)
+            .build(&mut table)?;
+
+        let (mut store, command) = instantiate(
+            get_component("stream_pollable_lifetimes"),
+            CommandCtx { table, wasi },
+        )
+        .await?;
+
+        let trap = command
+            .wasi_cli_run()
+            .call_run(&mut store)
+            .await
+            .err()
+            .expect("should trap");
+        use wasmtime_wasi::preview2::TableError;
+        assert!(matches!(trap.downcast_ref(), Some(TableError::HasChildren)));
+    }
+    Ok(())
 }

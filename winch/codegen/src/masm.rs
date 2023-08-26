@@ -1,9 +1,10 @@
-use crate::abi::{align_to, LocalSlot};
+use crate::abi::{self, align_to, LocalSlot};
 use crate::codegen::CodeGenContext;
 use crate::isa::reg::Reg;
 use crate::regalloc::RegAlloc;
-use cranelift_codegen::{Final, MachBufferFinalized};
+use cranelift_codegen::{Final, MachBufferFinalized, MachLabel};
 use std::{fmt::Debug, ops::Range};
+use wasmtime_environ::PtrSize;
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum DivKind {
@@ -21,6 +22,58 @@ pub(crate) enum RemKind {
     Unsigned,
 }
 
+/// A stack slot.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StackSlot {
+    /// The location of the slot, relative to the stack pointer.
+    pub offset: u32,
+    /// The size of the slot, in bytes.
+    pub size: u32,
+}
+
+/// Kinds of binary comparison in WebAssembly. The [`masm`] implementation for
+/// each ISA is responsible for emitting the correct sequence of instructions
+/// when lowering to machine code.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum CmpKind {
+    /// Equal.
+    Eq,
+    /// Not equal.
+    Ne,
+    /// Signed less than.
+    LtS,
+    /// Unsigned less than.
+    LtU,
+    /// Signed greater than.
+    GtS,
+    /// Unsigned greater than.
+    GtU,
+    /// Signed less than or equal.
+    LeS,
+    /// Unsigned less than or equal.
+    LeU,
+    /// Signed greater than or equal.
+    GeS,
+    /// Unsigned greater than or equal.
+    GeU,
+}
+
+/// Kinds of shifts in WebAssembly.The [`masm`] implementation for each ISA is
+/// responsible for emitting the correct sequence of instructions when
+/// lowering to machine code.
+pub(crate) enum ShiftKind {
+    /// Left shift.
+    Shl,
+    /// Signed right shift.
+    ShrS,
+    /// Unsigned right shift.
+    ShrU,
+    /// Left rotate.
+    Rotl,
+    /// Right rotate.
+    Rotr,
+}
+
 /// Operand size, in bits.
 #[derive(Copy, Debug, Clone, Eq, PartialEq)]
 pub(crate) enum OperandSize {
@@ -28,6 +81,37 @@ pub(crate) enum OperandSize {
     S32,
     /// 64 bits.
     S64,
+    /// 128 bits.
+    S128,
+}
+
+impl OperandSize {
+    /// The number of bits in the operand.
+    pub fn num_bits(&self) -> i32 {
+        match self {
+            OperandSize::S32 => 32,
+            OperandSize::S64 => 64,
+            OperandSize::S128 => 128,
+        }
+    }
+
+    /// The number of bytes in the operand.
+    pub fn bytes(&self) -> u32 {
+        match self {
+            Self::S32 => 4,
+            Self::S64 => 8,
+            Self::S128 => 16,
+        }
+    }
+
+    /// The binary logarithm of the number of bits in the operand.
+    pub fn log2(&self) -> u8 {
+        match self {
+            OperandSize::S32 => 5,
+            OperandSize::S64 => 6,
+            OperandSize::S128 => 7,
+        }
+    }
 }
 
 /// An abstraction over a register or immediate.
@@ -35,8 +119,56 @@ pub(crate) enum OperandSize {
 pub(crate) enum RegImm {
     /// A register.
     Reg(Reg),
-    /// 64-bit signed immediate.
-    Imm(i64),
+    /// A tagged immediate argument.
+    Imm(Imm),
+}
+
+/// An tagged representation of an immediate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Imm {
+    /// I32 immediate.
+    I32(u32),
+    /// I64 immediate.
+    I64(u64),
+    /// F32 immediate.
+    F32(u32),
+    /// F64 immediate.
+    F64(u64),
+}
+
+impl Imm {
+    /// Create a new I64 immediate.
+    pub fn i64(val: i64) -> Self {
+        Self::I64(val as u64)
+    }
+
+    /// Create a new I32 immediate.
+    pub fn i32(val: i32) -> Self {
+        Self::I32(val as u32)
+    }
+
+    /// Create a new F32 immediate.
+    // Temporary until support for f32.const is added.
+    #[allow(dead_code)]
+    pub fn f32(bits: u32) -> Self {
+        Self::F32(bits)
+    }
+
+    /// Create a new F64 immediate.
+    // Temporary until support for f64.const is added.
+    #[allow(dead_code)]
+    pub fn f64(bits: u64) -> Self {
+        Self::F64(bits)
+    }
+
+    /// Convert the immediate to i32, if possible.
+    pub fn to_i32(&self) -> Option<i32> {
+        match self {
+            Self::I32(v) => Some(*v as i32),
+            Self::I64(v) => i32::try_from(*v as i64).ok(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -53,9 +185,37 @@ impl RegImm {
         RegImm::Reg(r)
     }
 
-    /// Immediate constructor.
-    pub fn imm(imm: i64) -> Self {
-        RegImm::Imm(imm)
+    /// I64 immediate constructor.
+    pub fn i64(val: i64) -> Self {
+        RegImm::Imm(Imm::i64(val))
+    }
+
+    /// I32 immediate constructor.
+    pub fn i32(val: i32) -> Self {
+        RegImm::Imm(Imm::i32(val))
+    }
+
+    /// F32 immediate, stored using its bits representation.
+    // Temporary until support for f32.const is added.
+    #[allow(dead_code)]
+    pub fn f32(bits: u32) -> Self {
+        RegImm::Imm(Imm::f32(bits))
+    }
+
+    /// F64 immediate, stored using its bits representation.
+    // Temporary until support for f64.const is added.
+    #[allow(dead_code)]
+    pub fn f64(bits: u64) -> Self {
+        RegImm::Imm(Imm::f64(bits))
+    }
+
+    /// Get the underlying register of the operand,
+    /// if it is one.
+    pub fn get_reg(&self) -> Option<Reg> {
+        match self {
+            Self::Reg(r) => Some(*r),
+            _ => None,
+        }
     }
 }
 
@@ -86,6 +246,13 @@ pub(crate) trait MacroAssembler {
     /// The addressing mode.
     type Address: Copy;
 
+    /// The pointer representation of the target ISA,
+    /// used to access information from [`VMOffsets`].
+    type Ptr: PtrSize;
+
+    /// The ABI details of the target.
+    type ABI: abi::ABI;
+
     /// Emit the function prologue.
     fn prologue(&mut self);
 
@@ -97,6 +264,12 @@ pub(crate) trait MacroAssembler {
 
     /// Free stack space.
     fn free_stack(&mut self, bytes: u32);
+
+    /// Reset the stack pointer to the given offset;
+    ///
+    /// Used to reset the stack pointer to a given offset
+    /// when dealing with unreachable code.
+    fn reset_stack_pointer(&mut self, offset: u32);
 
     /// Get the address of a local slot.
     fn local_address(&mut self, local: &LocalSlot) -> Self::Address;
@@ -115,13 +288,7 @@ pub(crate) trait MacroAssembler {
     fn address_at_reg(&self, reg: Reg, offset: u32) -> Self::Address;
 
     /// Emit a function call to either a local or external function.
-    fn call(
-        &mut self,
-        alignment: u32,
-        addend: u32,
-        stack_args_size: u32,
-        f: impl FnMut(&mut Self) -> CalleeKind,
-    ) -> u32;
+    fn call(&mut self, stack_args_size: u32, f: impl FnMut(&mut Self) -> CalleeKind) -> u32;
 
     /// Get stack pointer offset.
     fn sp_offset(&self) -> u32;
@@ -133,10 +300,13 @@ pub(crate) trait MacroAssembler {
     fn load(&mut self, src: Self::Address, dst: Reg, size: OperandSize);
 
     /// Pop a value from the machine stack into the given register.
-    fn pop(&mut self, dst: Reg);
+    fn pop(&mut self, dst: Reg, size: OperandSize);
 
     /// Perform a move.
     fn mov(&mut self, src: RegImm, dst: RegImm, size: OperandSize);
+
+    /// Perform a conditional move.
+    fn cmov(&mut self, src: Reg, dst: Reg, cc: CmpKind, size: OperandSize);
 
     /// Perform add operation.
     fn add(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize);
@@ -146,6 +316,23 @@ pub(crate) trait MacroAssembler {
 
     /// Perform multiplication operation.
     fn mul(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize);
+
+    /// Perform logical and operation.
+    fn and(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize);
+
+    /// Perform logical or operation.
+    fn or(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize);
+
+    /// Perform logical exclusive or operation.
+    fn xor(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize);
+
+    /// Perform a shift operation.
+    /// Shift is special in that some architectures have specific expectations
+    /// regarding the location of the instruction arguments. To free the
+    /// caller from having to deal with the architecture specific constraints
+    /// we give this function access to the code generation context, allowing
+    /// each implementation to decide the lowering path.
+    fn shift(&mut self, context: &mut CodeGenContext, kind: ShiftKind, size: OperandSize);
 
     /// Perform division operation.
     /// Division is special in that some architectures have specific
@@ -163,8 +350,30 @@ pub(crate) trait MacroAssembler {
     /// Calculate remainder.
     fn rem(&mut self, context: &mut CodeGenContext, kind: RemKind, size: OperandSize);
 
-    /// Push the register to the stack, returning the offset.
-    fn push(&mut self, src: Reg) -> u32;
+    /// Compare src and dst and put the result in dst.
+    fn cmp(&mut self, src: RegImm, dest: Reg, size: OperandSize);
+
+    /// Compare src and dst and put the result in dst.
+    /// This function will potentially emit a series of instructions.
+    fn cmp_with_set(&mut self, src: RegImm, dst: Reg, kind: CmpKind, size: OperandSize);
+
+    /// Count the number of leading zeroes in src and put the result in dst.
+    /// In x64, this will emit multiple instructions if the `has_lzcnt` flag is
+    /// false.
+    fn clz(&mut self, src: Reg, dst: Reg, size: OperandSize);
+
+    /// Count the number of trailing zeroes in src and put the result in dst.
+    /// In x64, this will emit multiple instructions if the `has_tzcnt` flag is
+    /// false.
+    fn ctz(&mut self, src: Reg, dst: Reg, size: OperandSize);
+
+    /// Push the register to the stack, returning the stack slot metadata.
+    // NB
+    // The stack alignment should not be assumed after any call to `push`,
+    // unless explicitly aligned otherwise.  Typically, stack alignment is
+    // maintained at call sites and during the execution of
+    // epilogues.
+    fn push(&mut self, src: Reg, size: OperandSize) -> StackSlot;
 
     /// Finalize the assembly and return the result.
     fn finalize(self) -> MachBufferFinalized<Final>;
@@ -172,12 +381,17 @@ pub(crate) trait MacroAssembler {
     /// Zero a particular register.
     fn zero(&mut self, reg: Reg);
 
+    /// Count the number of 1 bits in src and put the result in dst. In x64,
+    /// this will emit multiple instructions if the `has_popcnt` flag is false.
+    fn popcnt(&mut self, context: &mut CodeGenContext, size: OperandSize);
+
     /// Zero a given memory range.
     ///
     /// The default implementation divides the given memory range
     /// into word-sized slots. Then it unrolls a series of store
     /// instructions, effectively assigning zero to each slot.
-    fn zero_mem_range(&mut self, mem: &Range<u32>, word_size: u32, regalloc: &mut RegAlloc) {
+    fn zero_mem_range(&mut self, mem: &Range<u32>, regalloc: &mut RegAlloc) {
+        let word_size = <Self::ABI as abi::ABI>::word_bytes();
         if mem.is_empty() {
             return;
         }
@@ -189,7 +403,7 @@ pub(crate) trait MacroAssembler {
             assert!(mem.start % 4 == 0);
             let start = align_to(mem.start, word_size);
             let addr: Self::Address = self.local_address(&LocalSlot::i32(start));
-            self.store(RegImm::imm(0), addr, OperandSize::S32);
+            self.store(RegImm::i32(0), addr, OperandSize::S32);
             // Ensure that the new start of the range, is word-size aligned.
             assert!(start % word_size == 0);
             start
@@ -201,7 +415,7 @@ pub(crate) trait MacroAssembler {
         if slots == 1 {
             let slot = LocalSlot::i64(start + word_size);
             let addr: Self::Address = self.local_address(&slot);
-            self.store(RegImm::imm(0), addr, OperandSize::S64);
+            self.store(RegImm::i64(0), addr, OperandSize::S64);
         } else {
             // TODO
             // Add an upper bound to this generation;
@@ -218,4 +432,30 @@ pub(crate) trait MacroAssembler {
             }
         }
     }
+
+    /// Generate a label.
+    fn get_label(&mut self) -> MachLabel;
+
+    /// Bind the given label at the current code offset.
+    fn bind(&mut self, label: MachLabel);
+
+    /// Conditional branch.
+    ///
+    /// Performs a comparison between the two operands,
+    /// and immediately after emits a jump to the given
+    /// label destination if the condition is met.
+    fn branch(
+        &mut self,
+        kind: CmpKind,
+        lhs: RegImm,
+        rhs: RegImm,
+        taken: MachLabel,
+        size: OperandSize,
+    );
+
+    /// Emits and unconditional jump to the given label.
+    fn jmp(&mut self, target: MachLabel);
+
+    /// Emit an unreachable code trap.
+    fn unreachable(&mut self);
 }

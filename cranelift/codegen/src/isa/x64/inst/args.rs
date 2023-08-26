@@ -291,7 +291,7 @@ pub use crate::isa::x64::lower::isle::generated_code::Amode;
 
 impl Amode {
     /// Create an immediate sign-extended and register addressing mode.
-    pub fn imm_reg(simm32: u32, base: Reg) -> Self {
+    pub fn imm_reg(simm32: i32, base: Reg) -> Self {
         debug_assert!(base.class() == RegClass::Int);
         Self::ImmReg {
             simm32,
@@ -301,7 +301,7 @@ impl Amode {
     }
 
     /// Create a sign-extended-32-to-64 with register and shift addressing mode.
-    pub fn imm_reg_reg_shift(simm32: u32, base: Gpr, index: Gpr, shift: u8) -> Self {
+    pub fn imm_reg_reg_shift(simm32: i32, base: Gpr, index: Gpr, shift: u8) -> Self {
         debug_assert!(base.class() == RegClass::Int);
         debug_assert!(index.class() == RegClass::Int);
         debug_assert!(shift <= 3);
@@ -435,7 +435,7 @@ impl Amode {
     }
 
     /// Offset the amode by a fixed offset.
-    pub(crate) fn offset(&self, offset: u32) -> Self {
+    pub(crate) fn offset(&self, offset: i32) -> Self {
         let mut ret = self.clone();
         match &mut ret {
             &mut Amode::ImmReg { ref mut simm32, .. } => *simm32 += offset,
@@ -456,7 +456,7 @@ impl PrettyPrint for Amode {
             Amode::ImmReg { simm32, base, .. } => {
                 // Note: size is always 8; the address is 64 bits,
                 // even if the addressed operand is smaller.
-                format!("{}({})", *simm32 as i32, pretty_print_reg(*base, 8, allocs))
+                format!("{}({})", *simm32, pretty_print_reg(*base, 8, allocs))
             }
             Amode::ImmRegRegShift {
                 simm32,
@@ -466,7 +466,7 @@ impl PrettyPrint for Amode {
                 ..
             } => format!(
                 "{}({},{},{})",
-                *simm32 as i32,
+                *simm32,
                 pretty_print_reg(base.to_reg(), 8, allocs),
                 pretty_print_reg(index.to_reg(), 8, allocs),
                 1 << shift
@@ -488,7 +488,7 @@ pub enum SyntheticAmode {
     /// within the function.
     NominalSPOffset {
         /// The nominal stack pointer value.
-        simm32: u32,
+        simm32: i32,
     },
 
     /// A virtual offset to a constant that will be emitted in the constant section of the buffer.
@@ -501,7 +501,7 @@ impl SyntheticAmode {
         Self::Real(amode)
     }
 
-    pub(crate) fn nominal_sp_offset(simm32: u32) -> Self {
+    pub(crate) fn nominal_sp_offset(simm32: i32) -> Self {
         SyntheticAmode::NominalSPOffset { simm32 }
     }
 
@@ -537,13 +537,8 @@ impl SyntheticAmode {
         match self {
             SyntheticAmode::Real(addr) => addr.clone(),
             SyntheticAmode::NominalSPOffset { simm32 } => {
-                let off = *simm32 as i64 + state.virtual_sp_offset;
-                // TODO will require a sequence of add etc.
-                assert!(
-                    off <= u32::max_value() as i64,
-                    "amode finalize: add sequence NYI"
-                );
-                Amode::imm_reg(off as u32, regs::rsp())
+                let off = *simm32 as i64 + state.virtual_sp_offset();
+                Amode::imm_reg(off.try_into().expect("invalid sp offset"), regs::rsp())
             }
             SyntheticAmode::ConstantOffset(c) => {
                 Amode::rip_relative(buffer.get_label_for_constant(*c))
@@ -586,7 +581,7 @@ impl PrettyPrint for SyntheticAmode {
             // See note in `Amode` regarding constant size of `8`.
             SyntheticAmode::Real(addr) => addr.pretty_print(8, allocs),
             SyntheticAmode::NominalSPOffset { simm32 } => {
-                format!("rsp({} + virtual offset)", *simm32 as i32)
+                format!("rsp({} + virtual offset)", *simm32)
             }
             SyntheticAmode::ConstantOffset(c) => format!("const({})", c.as_u32()),
         }
@@ -902,6 +897,24 @@ impl fmt::Debug for UnaryRmROpcode {
 impl fmt::Display for UnaryRmROpcode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self, f)
+    }
+}
+
+pub use crate::isa::x64::lower::isle::generated_code::UnaryRmRVexOpcode;
+
+impl UnaryRmRVexOpcode {
+    pub(crate) fn available_from(&self) -> SmallVec<[InstructionSet; 2]> {
+        match self {
+            UnaryRmRVexOpcode::Blsi | UnaryRmRVexOpcode::Blsmsk | UnaryRmRVexOpcode::Blsr => {
+                smallvec![InstructionSet::BMI1]
+            }
+        }
+    }
+}
+
+impl fmt::Display for UnaryRmRVexOpcode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&format!("{self:?}").to_lowercase())
     }
 }
 
@@ -1230,7 +1243,6 @@ impl SseOpcode {
             | SseOpcode::Pcmpgtd
             | SseOpcode::Pextrw
             | SseOpcode::Pinsrw
-            | SseOpcode::Pmaddubsw
             | SseOpcode::Pmaddwd
             | SseOpcode::Pmaxsw
             | SseOpcode::Pmaxub
@@ -1285,6 +1297,7 @@ impl SseOpcode {
             | SseOpcode::Pshufb
             | SseOpcode::Phaddw
             | SseOpcode::Phaddd
+            | SseOpcode::Pmaddubsw
             | SseOpcode::Movddup => SSSE3,
 
             SseOpcode::Blendvpd
@@ -1749,24 +1762,26 @@ impl fmt::Display for AvxOpcode {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq)]
 #[allow(missing_docs)]
-pub enum Avx512Opcode {
-    Vcvtudq2ps,
-    Vpabsq,
-    Vpermi2b,
-    Vpmullq,
-    Vpopcntb,
+pub enum Avx512TupleType {
+    Full,
+    FullMem,
+    Mem128,
 }
+
+pub use crate::isa::x64::lower::isle::generated_code::Avx512Opcode;
 
 impl Avx512Opcode {
     /// Which `InstructionSet`s support the opcode?
     pub(crate) fn available_from(&self) -> SmallVec<[InstructionSet; 2]> {
         match self {
-            Avx512Opcode::Vcvtudq2ps => {
+            Avx512Opcode::Vcvtudq2ps
+            | Avx512Opcode::Vpabsq
+            | Avx512Opcode::Vpsraq
+            | Avx512Opcode::VpsraqImm => {
                 smallvec![InstructionSet::AVX512F, InstructionSet::AVX512VL]
             }
-            Avx512Opcode::Vpabsq => smallvec![InstructionSet::AVX512F, InstructionSet::AVX512VL],
             Avx512Opcode::Vpermi2b => {
                 smallvec![InstructionSet::AVX512VL, InstructionSet::AVX512VBMI]
             }
@@ -1776,24 +1791,29 @@ impl Avx512Opcode {
             }
         }
     }
-}
 
-impl fmt::Debug for Avx512Opcode {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        let name = match self {
-            Avx512Opcode::Vcvtudq2ps => "vcvtudq2ps",
-            Avx512Opcode::Vpabsq => "vpabsq",
-            Avx512Opcode::Vpermi2b => "vpermi2b",
-            Avx512Opcode::Vpmullq => "vpmullq",
-            Avx512Opcode::Vpopcntb => "vpopcntb",
-        };
-        write!(fmt, "{}", name)
+    /// What is the "TupleType" of this opcode, which affects the scaling factor
+    /// for 8-bit displacements when this instruction uses memory operands.
+    ///
+    /// This can be found in the encoding table for each instruction and is
+    /// interpreted according to Table 2-34 and 2-35 in the Intel instruction
+    /// manual.
+    pub fn tuple_type(&self) -> Avx512TupleType {
+        use Avx512Opcode::*;
+        use Avx512TupleType::*;
+
+        match self {
+            Vcvtudq2ps | Vpabsq | Vpmullq | VpsraqImm => Full,
+            Vpermi2b | Vpopcntb => FullMem,
+            Vpsraq => Mem128,
+        }
     }
 }
 
 impl fmt::Display for Avx512Opcode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
+        let s = format!("{self:?}");
+        f.write_str(&s.to_lowercase())
     }
 }
 

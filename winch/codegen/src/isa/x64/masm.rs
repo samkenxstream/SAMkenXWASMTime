@@ -1,16 +1,27 @@
 use super::{
+    abi::X64ABI,
     address::Address,
-    asm::{Assembler, Operand},
+    asm::Assembler,
     regs::{self, rbp, rsp},
 };
-use crate::masm::{DivKind, MacroAssembler as Masm, OperandSize, RegImm, RemKind};
+
+use crate::masm::{
+    CmpKind, DivKind, Imm as I, MacroAssembler as Masm, OperandSize, RegImm, RemKind, ShiftKind,
+};
+use crate::{abi::ABI, masm::StackSlot};
 use crate::{
-    abi::{align_to, calculate_frame_adjustment, LocalSlot},
+    abi::{self, align_to, calculate_frame_adjustment, LocalSlot},
     codegen::CodeGenContext,
     stack::Val,
 };
-use crate::{isa::reg::Reg, masm::CalleeKind};
-use cranelift_codegen::{isa::x64::settings as x64_settings, settings, Final, MachBufferFinalized};
+use crate::{
+    isa::reg::{Reg, RegClass},
+    masm::CalleeKind,
+};
+use cranelift_codegen::{
+    ir::TrapCode, isa::x64::settings as x64_settings, settings, Final, MachBufferFinalized,
+    MachLabel,
+};
 
 /// x64 MacroAssembler.
 pub(crate) struct MacroAssembler {
@@ -18,33 +29,14 @@ pub(crate) struct MacroAssembler {
     sp_offset: u32,
     /// Low level assembler.
     asm: Assembler,
-}
-
-// Conversions between generic masm arguments and x64 operands.
-
-impl From<RegImm> for Operand {
-    fn from(rimm: RegImm) -> Self {
-        match rimm {
-            RegImm::Reg(r) => r.into(),
-            RegImm::Imm(imm) => Operand::Imm(imm),
-        }
-    }
-}
-
-impl From<Reg> for Operand {
-    fn from(reg: Reg) -> Self {
-        Operand::Reg(reg)
-    }
-}
-
-impl From<Address> for Operand {
-    fn from(addr: Address) -> Self {
-        Operand::Mem(addr)
-    }
+    /// ISA flags.
+    flags: x64_settings::Flags,
 }
 
 impl Masm for MacroAssembler {
     type Address = Address;
+    type Ptr = u8;
+    type ABI = X64ABI;
 
     fn prologue(&mut self) {
         let frame_pointer = rbp();
@@ -55,14 +47,24 @@ impl Masm for MacroAssembler {
             .mov_rr(stack_pointer, frame_pointer, OperandSize::S64);
     }
 
-    fn push(&mut self, reg: Reg) -> u32 {
-        self.asm.push_r(reg);
-        // In x64 the push instruction takes either
-        // 2 or 8 bytes; in our case we're always
-        // assuming 8 bytes per push.
-        self.increment_sp(8);
+    fn push(&mut self, reg: Reg, size: OperandSize) -> StackSlot {
+        let bytes = if reg.is_int() {
+            self.asm.push_r(reg);
+            let increment = <Self::ABI as ABI>::word_bytes();
+            self.increment_sp(increment);
+            increment
+        } else {
+            let bytes = size.bytes();
+            self.reserve_stack(bytes);
+            self.asm
+                .xmm_mov_rm(reg, &self.address_from_sp(self.sp_offset), size);
+            bytes
+        };
 
-        self.sp_offset
+        StackSlot {
+            offset: self.sp_offset,
+            size: bytes,
+        }
     }
 
     fn reserve_stack(&mut self, bytes: u32) {
@@ -80,6 +82,10 @@ impl Masm for MacroAssembler {
         }
         self.asm.add_ir(bytes as i32, rsp(), OperandSize::S64);
         self.decrement_sp(bytes);
+    }
+
+    fn reset_stack_pointer(&mut self, offset: u32) {
+        self.sp_offset = offset;
     }
 
     fn local_address(&mut self, local: &LocalSlot) -> Address {
@@ -106,25 +112,43 @@ impl Masm for MacroAssembler {
     }
 
     fn store(&mut self, src: RegImm, dst: Address, size: OperandSize) {
-        let src: Operand = src.into();
-        let dst: Operand = dst.into();
-
-        self.asm.mov(src, dst, size);
+        match src {
+            RegImm::Imm(imm) => match imm {
+                I::I32(v) => self.asm.mov_im(v as u64, &dst, size),
+                I::I64(v) => self.asm.mov_im(v, &dst, size),
+                // Immediate to memory moves are currently only used
+                // to zero a memory range, which only involves
+                // ints. See [`MacroAssembler::zero_mem_range`].
+                i => panic!("Cannot store immediate {:?}", i),
+            },
+            RegImm::Reg(reg) => {
+                if reg.is_int() {
+                    self.asm.mov_rm(reg, &dst, size);
+                } else {
+                    self.asm.xmm_mov_rm(reg, &dst, size);
+                }
+            }
+        }
     }
 
-    fn pop(&mut self, dst: Reg) {
-        self.asm.pop_r(dst);
-        // Similar to the comment in `push`, we assume 8 bytes per pop.
-        self.decrement_sp(8);
+    fn pop(&mut self, dst: Reg, size: OperandSize) {
+        if dst.is_int() {
+            self.asm.pop_r(dst);
+            self.decrement_sp(<Self::ABI as abi::ABI>::word_bytes());
+        } else {
+            let addr = self.address_at_sp(self.sp_offset);
+            self.asm.xmm_mov_mr(&addr, dst, size);
+            self.free_stack(size.bytes());
+        }
     }
 
     fn call(
         &mut self,
-        alignment: u32,
-        addend: u32,
         stack_args_size: u32,
         mut load_callee: impl FnMut(&mut Self) -> CalleeKind,
     ) -> u32 {
+        let alignment: u32 = <Self::ABI as abi::ABI>::call_stack_align().into();
+        let addend: u32 = <Self::ABI as abi::ABI>::arg_base_offset().into();
         let delta = calculate_frame_adjustment(self.sp_offset(), addend, alignment);
         let aligned_args_size = align_to(stack_args_size, alignment);
         let total_stack = delta + aligned_args_size;
@@ -135,9 +159,11 @@ impl Masm for MacroAssembler {
     }
 
     fn load(&mut self, src: Address, dst: Reg, size: OperandSize) {
-        let src = src.into();
-        let dst = dst.into();
-        self.asm.mov(src, dst, size);
+        if dst.is_int() {
+            self.asm.mov_mr(&src, dst, size);
+        } else {
+            self.asm.xmm_mov_mr(&src, dst, size);
+        }
     }
 
     fn sp_offset(&self) -> u32 {
@@ -149,93 +175,233 @@ impl Masm for MacroAssembler {
     }
 
     fn mov(&mut self, src: RegImm, dst: RegImm, size: OperandSize) {
-        let src: Operand = src.into();
-        let dst: Operand = dst.into();
+        match (src, dst) {
+            rr @ (RegImm::Reg(src), RegImm::Reg(dst)) => match (src.class(), dst.class()) {
+                (RegClass::Int, RegClass::Int) => self.asm.mov_rr(src, dst, size),
+                (RegClass::Float, RegClass::Float) => self.asm.xmm_mov_rr(src, dst, size),
+                _ => Self::handle_invalid_operand_combination(rr.0, rr.1),
+            },
+            (RegImm::Imm(imm), RegImm::Reg(dst)) => match imm {
+                I::I32(v) => self.asm.mov_ir(v as u64, dst, size),
+                I::I64(v) => self.asm.mov_ir(v as u64, dst, size),
+                I::F32(v) => {
+                    let addr = self.asm.add_constant(v.to_le_bytes().as_slice());
+                    self.asm.xmm_mov_mr(&addr, dst, size);
+                }
+                I::F64(v) => {
+                    let addr = self.asm.add_constant(v.to_le_bytes().as_slice());
+                    self.asm.xmm_mov_mr(&addr, dst, size);
+                }
+            },
+            _ => Self::handle_invalid_operand_combination(src, dst),
+        }
+    }
 
-        self.asm.mov(src, dst, size);
+    fn cmov(&mut self, src: Reg, dst: Reg, cc: CmpKind, size: OperandSize) {
+        match (src.class(), dst.class()) {
+            (RegClass::Int, RegClass::Int) => self.asm.cmov(src, dst, cc, size),
+            (RegClass::Float, RegClass::Float) => self.asm.xmm_cmov(src, dst, cc, size),
+            _ => Self::handle_invalid_operand_combination(src.into(), dst.into()),
+        }
     }
 
     fn add(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize) {
-        let (src, dst): (Operand, Operand) = if dst == lhs {
-            (rhs.into(), dst.into())
-        } else {
-            panic!(
-                "the destination and first source argument must be the same, dst={:?}, lhs={:?}",
-                dst, lhs
-            );
-        };
+        Self::ensure_two_argument_form(&dst, &lhs);
+        match (rhs, dst) {
+            (RegImm::Imm(imm), RegImm::Reg(reg)) => {
+                if let Some(v) = imm.to_i32() {
+                    self.asm.add_ir(v, reg, size);
+                } else {
+                    let scratch = regs::scratch();
+                    self.load_constant(&imm, scratch, size);
+                    self.asm.add_rr(scratch, reg, size);
+                }
+            }
 
-        self.asm.add(src, dst, size);
+            (RegImm::Reg(src), RegImm::Reg(dst)) => {
+                self.asm.add_rr(src, dst, size);
+            }
+            _ => Self::handle_invalid_operand_combination(rhs, dst),
+        }
     }
 
     fn sub(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize) {
-        let (src, dst): (Operand, Operand) = if dst == lhs {
-            (rhs.into(), dst.into())
-        } else {
-            panic!(
-                "the destination and first source argument must be the same, dst={:?}, lhs={:?}",
-                dst, lhs
-            );
-        };
+        Self::ensure_two_argument_form(&dst, &lhs);
+        match (rhs, dst) {
+            (RegImm::Imm(imm), RegImm::Reg(reg)) => {
+                if let Some(v) = imm.to_i32() {
+                    self.asm.sub_ir(v, reg, size);
+                } else {
+                    let scratch = regs::scratch();
+                    self.load_constant(&imm, scratch, size);
+                    self.asm.sub_rr(scratch, reg, size);
+                }
+            }
 
-        self.asm.sub(src, dst, size);
+            (RegImm::Reg(src), RegImm::Reg(dst)) => {
+                self.asm.sub_rr(src, dst, size);
+            }
+            _ => Self::handle_invalid_operand_combination(rhs, dst),
+        }
     }
 
     fn mul(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize) {
-        let (src, dst): (Operand, Operand) = if dst == lhs {
-            (rhs.into(), dst.into())
-        } else {
-            panic!(
-                "the destination and first source argument must be the same, dst={:?}, lhs={:?}",
-                dst, lhs
-            );
-        };
+        Self::ensure_two_argument_form(&dst, &lhs);
+        match (rhs, dst) {
+            (RegImm::Imm(imm), RegImm::Reg(reg)) => {
+                if let Some(v) = imm.to_i32() {
+                    self.asm.mul_ir(v, reg, size);
+                } else {
+                    let scratch = regs::scratch();
+                    self.load_constant(&imm, scratch, size);
+                    self.asm.mul_rr(scratch, reg, size);
+                }
+            }
 
-        self.asm.mul(src, dst, size);
+            (RegImm::Reg(src), RegImm::Reg(dst)) => {
+                self.asm.mul_rr(src, dst, size);
+            }
+            _ => Self::handle_invalid_operand_combination(rhs, dst),
+        }
+    }
+
+    fn and(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize) {
+        Self::ensure_two_argument_form(&dst, &lhs);
+        match (rhs, dst) {
+            (RegImm::Imm(imm), RegImm::Reg(reg)) => {
+                if let Some(v) = imm.to_i32() {
+                    self.asm.and_ir(v, reg, size);
+                } else {
+                    let scratch = regs::scratch();
+                    self.load_constant(&imm, scratch, size);
+                    self.asm.and_rr(scratch, reg, size);
+                }
+            }
+
+            (RegImm::Reg(src), RegImm::Reg(dst)) => {
+                self.asm.and_rr(src, dst, size);
+            }
+            _ => Self::handle_invalid_operand_combination(rhs, dst),
+        }
+    }
+
+    fn or(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize) {
+        Self::ensure_two_argument_form(&dst, &lhs);
+        match (rhs, dst) {
+            (RegImm::Imm(imm), RegImm::Reg(reg)) => {
+                if let Some(v) = imm.to_i32() {
+                    self.asm.or_ir(v, reg, size);
+                } else {
+                    let scratch = regs::scratch();
+                    self.load_constant(&imm, scratch, size);
+                    self.asm.or_rr(scratch, reg, size);
+                }
+            }
+
+            (RegImm::Reg(src), RegImm::Reg(dst)) => {
+                self.asm.or_rr(src, dst, size);
+            }
+            _ => Self::handle_invalid_operand_combination(rhs, dst),
+        }
+    }
+
+    fn xor(&mut self, dst: RegImm, lhs: RegImm, rhs: RegImm, size: OperandSize) {
+        Self::ensure_two_argument_form(&dst, &lhs);
+        match (rhs, dst) {
+            (RegImm::Imm(imm), RegImm::Reg(reg)) => {
+                if let Some(v) = imm.to_i32() {
+                    self.asm.xor_ir(v, reg, size);
+                } else {
+                    let scratch = regs::scratch();
+                    self.load_constant(&imm, scratch, size);
+                    self.asm.xor_rr(scratch, reg, size);
+                }
+            }
+
+            (RegImm::Reg(src), RegImm::Reg(dst)) => {
+                self.asm.xor_rr(src, dst, size);
+            }
+            _ => Self::handle_invalid_operand_combination(rhs, dst),
+        }
+    }
+
+    fn shift(&mut self, context: &mut CodeGenContext, kind: ShiftKind, size: OperandSize) {
+        let top = context.stack.peek().expect("value at stack top");
+
+        if size == OperandSize::S32 && top.is_i32_const() {
+            let val = context
+                .stack
+                .pop_i32_const()
+                .expect("i32 const value at stack top");
+            let typed_reg = context.pop_to_reg(self, None);
+
+            self.asm.shift_ir(val as u8, typed_reg.into(), kind, size);
+
+            context.stack.push(typed_reg.into());
+        } else if size == OperandSize::S64 && top.is_i64_const() {
+            let val = context
+                .stack
+                .pop_i64_const()
+                .expect("i64 const value at stack top");
+            let typed_reg = context.pop_to_reg(self, None);
+
+            self.asm.shift_ir(val as u8, typed_reg.into(), kind, size);
+
+            context.stack.push(typed_reg.into());
+        } else {
+            // Number of bits to shift must be in the CL register.
+            let src = context.pop_to_reg(self, Some(regs::rcx()));
+            let dst = context.pop_to_reg(self, None);
+
+            self.asm.shift_rr(src.into(), dst.into(), kind, size);
+
+            context.free_reg(src);
+            context.stack.push(dst.into());
+        }
     }
 
     fn div(&mut self, context: &mut CodeGenContext, kind: DivKind, size: OperandSize) {
         // Allocate rdx:rax.
-        let rdx = context.gpr(regs::rdx(), self);
-        let rax = context.gpr(regs::rax(), self);
+        let rdx = context.reg(regs::rdx(), self);
+        let rax = context.reg(regs::rax(), self);
 
         // Allocate the divisor, which can be any gpr.
-        let divisor = context.pop_to_reg(self, None, size);
+        let divisor = context.pop_to_reg(self, None);
 
         // Mark rax as allocatable.
-        context.regalloc.free_gpr(rax);
+        context.free_reg(rax);
         // Move the top value to rax.
-        let rax = context.pop_to_reg(self, Some(rax), size);
-        self.asm.div(divisor, (rax, rdx), kind, size);
+        let rax = context.pop_to_reg(self, Some(rax));
+        self.asm.div(divisor.into(), (rax.into(), rdx), kind, size);
 
         // Free the divisor and rdx.
-        context.free_gpr(divisor);
-        context.free_gpr(rdx);
+        context.free_reg(divisor);
+        context.free_reg(rdx);
 
         // Push the quotient.
-        context.stack.push(Val::reg(rax));
+        context.stack.push(rax.into());
     }
 
     fn rem(&mut self, context: &mut CodeGenContext, kind: RemKind, size: OperandSize) {
         // Allocate rdx:rax.
-        let rdx = context.gpr(regs::rdx(), self);
-        let rax = context.gpr(regs::rax(), self);
+        let rdx = context.reg(regs::rdx(), self);
+        let rax = context.reg(regs::rax(), self);
 
         // Allocate the divisor, which can be any gpr.
-        let divisor = context.pop_to_reg(self, None, size);
+        let divisor = context.pop_to_reg(self, None);
 
         // Mark rax as allocatable.
-        context.regalloc.free_gpr(rax);
+        context.free_reg(rax);
         // Move the top value to rax.
-        let rax = context.pop_to_reg(self, Some(rax), size);
-        self.asm.rem(divisor, (rax, rdx), kind, size);
+        let rax = context.pop_to_reg(self, Some(rax));
+        self.asm.rem(divisor.reg, (rax.into(), rdx), kind, size);
 
         // Free the divisor and rax.
-        context.free_gpr(divisor);
-        context.free_gpr(rax);
+        context.free_reg(divisor);
+        context.free_reg(rax);
 
         // Push the remainder.
-        context.stack.push(Val::reg(rdx));
+        context.stack.push(Val::reg(rdx, divisor.ty));
     }
 
     fn epilogue(&mut self, locals_size: u32) {
@@ -256,6 +422,175 @@ impl Masm for MacroAssembler {
     fn address_at_reg(&self, reg: Reg, offset: u32) -> Self::Address {
         Address::offset(reg, offset)
     }
+
+    fn cmp(&mut self, src: RegImm, dst: Reg, size: OperandSize) {
+        match src {
+            RegImm::Imm(imm) => {
+                if let Some(v) = imm.to_i32() {
+                    self.asm.cmp_ir(v, dst, size);
+                } else {
+                    let scratch = regs::scratch();
+                    self.load_constant(&imm, scratch, size);
+                    self.asm.cmp_rr(scratch, dst, size);
+                }
+            }
+            RegImm::Reg(src) => {
+                self.asm.cmp_rr(src, dst, size);
+            }
+        }
+    }
+
+    fn cmp_with_set(&mut self, src: RegImm, dst: Reg, kind: CmpKind, size: OperandSize) {
+        self.cmp(src, dst, size);
+        self.asm.setcc(kind, dst);
+    }
+
+    fn clz(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        if self.flags.has_lzcnt() {
+            self.asm.lzcnt(src, dst, size);
+        } else {
+            let scratch = regs::scratch();
+
+            // Use the following approach:
+            // dst = size.num_bits() - bsr(src) - is_not_zero
+            //     = size.num.bits() + -bsr(src) - is_not_zero.
+            self.asm.bsr(src.into(), dst.into(), size);
+            self.asm.setcc(CmpKind::Ne, scratch.into());
+            self.asm.neg(dst, dst, size);
+            self.asm.add_ir(size.num_bits(), dst, size);
+            self.asm.sub_rr(scratch, dst, size);
+        }
+    }
+
+    fn ctz(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        if self.flags.has_bmi1() {
+            self.asm.tzcnt(src, dst, size);
+        } else {
+            let scratch = regs::scratch();
+
+            // Use the following approach:
+            // dst = bsf(src) + (is_zero * size.num_bits())
+            //     = bsf(src) + (is_zero << size.log2()).
+            // BSF outputs the correct value for every value except 0.
+            // When the value is 0, BSF outputs 0, correct output for ctz is
+            // the number of bits.
+            self.asm.bsf(src.into(), dst.into(), size);
+            self.asm.setcc(CmpKind::Eq, scratch.into());
+            self.asm
+                .shift_ir(size.log2(), scratch, ShiftKind::Shl, size);
+            self.asm.add_rr(scratch, dst, size);
+        }
+    }
+
+    fn get_label(&mut self) -> MachLabel {
+        let buffer = self.asm.buffer_mut();
+        buffer.get_label()
+    }
+
+    fn bind(&mut self, label: MachLabel) {
+        let buffer = self.asm.buffer_mut();
+        buffer.bind_label(label, &mut Default::default());
+    }
+
+    fn branch(
+        &mut self,
+        kind: CmpKind,
+        lhs: RegImm,
+        rhs: RegImm,
+        taken: MachLabel,
+        size: OperandSize,
+    ) {
+        use CmpKind::*;
+
+        match &(lhs, rhs) {
+            (RegImm::Reg(rlhs), RegImm::Reg(rrhs)) => {
+                // If the comparision kind is zero or not zero and both operands
+                // are the same register, emit a test instruction. Else we emit
+                // a normal comparison.
+                if (kind == Eq || kind == Ne) && (rlhs == rrhs) {
+                    self.asm.test_rr(*rrhs, *rlhs, size);
+                } else {
+                    self.cmp(lhs, rhs.get_reg().unwrap(), size);
+                }
+            }
+            _ => self.cmp(lhs, rhs.get_reg().unwrap(), size),
+        }
+        self.asm.jmp_if(kind, taken);
+    }
+
+    fn jmp(&mut self, target: MachLabel) {
+        self.asm.jmp(target);
+    }
+
+    fn popcnt(&mut self, context: &mut CodeGenContext, size: OperandSize) {
+        let src = context.pop_to_reg(self, None);
+        if self.flags.has_popcnt() {
+            self.asm.popcnt(src.into(), size);
+            context.stack.push(src.into());
+        } else {
+            // The fallback functionality here is based on `MacroAssembler::popcnt64` in:
+            // https://searchfox.org/mozilla-central/source/js/src/jit/x64/MacroAssembler-x64-inl.h#495
+
+            let tmp = context.any_gpr(self);
+            let dst = src;
+            let (masks, shift_amt) = match size {
+                OperandSize::S64 => (
+                    [
+                        0x5555555555555555, // m1
+                        0x3333333333333333, // m2
+                        0x0f0f0f0f0f0f0f0f, // m4
+                        0x0101010101010101, // h01
+                    ],
+                    56u8,
+                ),
+                // 32-bit popcount is the same, except the masks are half as
+                // wide and we shift by 24 at the end rather than 56
+                OperandSize::S32 => (
+                    [0x55555555i64, 0x33333333i64, 0x0f0f0f0fi64, 0x01010101i64],
+                    24u8,
+                ),
+                _ => unreachable!(),
+            };
+            self.asm.mov_rr(src.into(), tmp, size);
+
+            // x -= (x >> 1) & m1;
+            self.asm.shift_ir(1u8, dst.into(), ShiftKind::ShrU, size);
+            let lhs = dst.reg.into();
+            self.and(lhs, lhs, RegImm::i64(masks[0]), size);
+            self.asm.sub_rr(dst.into(), tmp, size);
+
+            // x = (x & m2) + ((x >> 2) & m2);
+            self.asm.mov_rr(tmp, dst.into(), size);
+            // Load `0x3333...` into the scratch reg once, allowing us to use
+            // `and_rr` and avoid inadvertently loading it twice as with `and`
+            let scratch = regs::scratch();
+            self.load_constant(&I::i64(masks[1]), scratch, size);
+            self.asm.and_rr(scratch, dst.into(), size);
+            self.asm.shift_ir(2u8, tmp, ShiftKind::ShrU, size);
+            self.asm.and_rr(scratch, tmp, size);
+            self.asm.add_rr(dst.into(), tmp, size);
+
+            // x = (x + (x >> 4)) & m4;
+            self.asm.mov_rr(tmp.into(), dst.into(), size);
+            self.asm.shift_ir(4u8, dst.into(), ShiftKind::ShrU, size);
+            self.asm.add_rr(tmp, dst.into(), size);
+            let lhs = dst.reg.into();
+            self.and(lhs, lhs, RegImm::i64(masks[2]), size);
+
+            // (x * h01) >> shift_amt
+            let lhs = dst.reg.into();
+            self.mul(lhs, lhs, RegImm::i64(masks[3]), size);
+            self.asm
+                .shift_ir(shift_amt, dst.into(), ShiftKind::ShrU, size);
+
+            context.stack.push(dst.into());
+            context.free_reg(tmp);
+        }
+    }
+
+    fn unreachable(&mut self) {
+        self.asm.trap(TrapCode::UnreachableCodeReached)
+    }
 }
 
 impl MacroAssembler {
@@ -263,7 +598,8 @@ impl MacroAssembler {
     pub fn new(shared_flags: settings::Flags, isa_flags: x64_settings::Flags) -> Self {
         Self {
             sp_offset: 0,
-            asm: Assembler::new(shared_flags, isa_flags),
+            asm: Assembler::new(shared_flags, isa_flags.clone()),
+            flags: isa_flags,
         }
     }
 
@@ -279,5 +615,26 @@ impl MacroAssembler {
             bytes
         );
         self.sp_offset -= bytes;
+    }
+
+    fn load_constant(&mut self, constant: &I, dst: Reg, size: OperandSize) {
+        match constant {
+            I::I32(v) => self.asm.mov_ir(*v as u64, dst, size),
+            I::I64(v) => self.asm.mov_ir(*v, dst, size),
+            _ => panic!(),
+        }
+    }
+
+    fn handle_invalid_operand_combination<T>(src: RegImm, dst: RegImm) -> T {
+        panic!("Invalid operand combination; src={:?}, dst={:?}", src, dst);
+    }
+
+    fn ensure_two_argument_form(dst: &RegImm, lhs: &RegImm) {
+        assert!(
+            dst == lhs,
+            "the destination and first source argument must be the same, dst={:?}, lhs={:?}",
+            dst,
+            lhs
+        );
     }
 }

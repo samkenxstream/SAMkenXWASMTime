@@ -7,7 +7,7 @@ use crate::value::{DataValueExt, ValueConversionKind, ValueError, ValueResult};
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    types, AbiParam, AtomicRmwOp, Block, BlockCall, ExternalName, FuncRef, Function,
+    types, AbiParam, AtomicRmwOp, Block, BlockCall, Endianness, ExternalName, FuncRef, Function,
     InstructionData, MemFlags, Opcode, TrapCode, Type, Value as ValueRef,
 };
 use log::trace;
@@ -879,21 +879,11 @@ where
             (a, b) if a.is_zero()? && b.is_zero()? && b.is_negative()? => b,
             (a, b) => a.smin(b)?,
         }),
-        Opcode::FminPseudo => assign(match (arg(0), arg(1)) {
-            (a, b) if a.is_nan()? || b.is_nan()? => a,
-            (a, b) if a.is_zero()? && b.is_zero()? => a,
-            (a, b) => a.smin(b)?,
-        }),
         Opcode::Fmax => assign(match (arg(0), arg(1)) {
             (a, _) if a.is_nan()? => a,
             (_, b) if b.is_nan()? => b,
             (a, b) if a.is_zero()? && b.is_zero()? && a.is_negative()? => b,
             (a, b) if a.is_zero()? && b.is_zero()? && b.is_negative()? => a,
-            (a, b) => a.smax(b)?,
-        }),
-        Opcode::FmaxPseudo => assign(match (arg(0), arg(1)) {
-            (a, b) if a.is_nan()? || b.is_nan()? => a,
-            (a, b) if a.is_zero()? && b.is_zero()? => a,
             (a, b) => a.smax(b)?,
         }),
         Opcode::Ceil => unary(DataValueExt::ceil, arg(0))?,
@@ -904,11 +894,21 @@ where
         Opcode::IsInvalid => unimplemented!("IsInvalid"),
         Opcode::Bitcast | Opcode::ScalarToVector => {
             let input_ty = inst_context.type_of(inst_context.args()[0]).unwrap();
-            let arg0 = extractlanes(&arg(0), input_ty)?;
-            let lanes = &arg0
-                .into_iter()
-                .map(|x| DataValue::convert(x, ValueConversionKind::Exact(ctrl_ty.lane_type())))
-                .collect::<ValueResult<SimdVec<DataValue>>>()?;
+            let lanes = &if input_ty.is_vector() {
+                assert_eq!(
+                    inst.memflags()
+                        .expect("byte order flag to be set")
+                        .endianness(Endianness::Little),
+                    Endianness::Little,
+                    "Only little endian bitcasts on vectors are supported"
+                );
+                extractlanes(&arg(0), ctrl_ty)?
+            } else {
+                extractlanes(&arg(0), input_ty)?
+                    .into_iter()
+                    .map(|x| DataValue::convert(x, ValueConversionKind::Exact(ctrl_ty.lane_type())))
+                    .collect::<ValueResult<SimdVec<DataValue>>>()?
+            };
             assign(match inst.opcode() {
                 Opcode::Bitcast => vectorizelanes(lanes, ctrl_ty)?,
                 Opcode::ScalarToVector => vectorizelanes_all(lanes, ctrl_ty)?,
@@ -1030,12 +1030,13 @@ where
             let any = fold_vector(arg(0), ctrl_ty, init.clone(), |acc, lane| acc.or(lane))?;
             assign(DataValue::bool(any != init, false, types::I8)?)
         }
-        Opcode::VallTrue => {
-            let lane_ty = ctrl_ty.lane_type();
-            let init = DataValue::bool(true, true, lane_ty)?;
-            let all = fold_vector(arg(0), ctrl_ty, init.clone(), |acc, lane| acc.and(lane))?;
-            assign(DataValue::bool(all == init, false, types::I8)?)
-        }
+        Opcode::VallTrue => assign(DataValue::bool(
+            !(arg(0).iter_lanes(ctrl_ty)?.try_fold(false, |acc, lane| {
+                Ok::<bool, ValueError>(acc | lane.is_zero()?)
+            })?),
+            false,
+            types::I8,
+        )?),
         Opcode::SwidenLow | Opcode::SwidenHigh | Opcode::UwidenLow | Opcode::UwidenHigh => {
             let new_type = ctrl_ty.merge_lanes().unwrap();
             let conv_type = match inst.opcode() {
@@ -1144,29 +1145,6 @@ where
                 &x.into_iter()
                     .map(|x| DataValue::float(bits(x)?, ctrl_ty.lane_type()))
                     .collect::<ValueResult<SimdVec<DataValue>>>()?,
-                ctrl_ty,
-            )?)
-        }
-        Opcode::FcvtLowFromSint => {
-            let in_ty = inst_context.type_of(inst_context.args()[0]).unwrap();
-            let x = extractlanes(&arg(0), in_ty)?;
-
-            assign(vectorizelanes(
-                &(x[..(ctrl_ty.lane_count() as usize)]
-                    .into_iter()
-                    .map(|x| {
-                        DataValue::float(
-                            match ctrl_ty.lane_type() {
-                                types::F32 => {
-                                    (x.to_owned().into_int_signed()? as f32).to_bits() as u64
-                                }
-                                types::F64 => (x.to_owned().into_int_signed()? as f64).to_bits(),
-                                _ => unimplemented!("unexpected promotion to {:?}", ctrl_ty),
-                            },
-                            ctrl_ty.lane_type(),
-                        )
-                    })
-                    .collect::<ValueResult<SimdVec<DataValue>>>()?),
                 ctrl_ty,
             )?)
         }
@@ -1447,11 +1425,14 @@ fn fcmp(code: FloatCC, left: &DataValue, right: &DataValue) -> ValueResult<bool>
     })
 }
 
-type SimdVec<DataValue> = SmallVec<[DataValue; 4]>;
+pub type SimdVec<DataValue> = SmallVec<[DataValue; 4]>;
 
 /// Converts a SIMD vector value into a Rust array of [Value] for processing.
 /// If `x` is a scalar, it will be returned as a single-element array.
-fn extractlanes(x: &DataValue, vector_type: types::Type) -> ValueResult<SimdVec<DataValue>> {
+pub(crate) fn extractlanes(
+    x: &DataValue,
+    vector_type: types::Type,
+) -> ValueResult<SimdVec<DataValue>> {
     let lane_type = vector_type.lane_type();
     let mut lanes = SimdVec::new();
     // Wrap scalar values as a single-element vector and return.

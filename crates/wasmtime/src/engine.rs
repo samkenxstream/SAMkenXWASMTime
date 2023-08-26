@@ -77,7 +77,7 @@ impl Engine {
         // Ensure that wasmtime_runtime's signal handlers are configured. This
         // is the per-program initialization required for handling traps, such
         // as configuring signals, vectored exception handlers, etc.
-        wasmtime_runtime::init_traps(crate::module::is_wasm_trap_pc);
+        wasmtime_runtime::init_traps(crate::module::is_wasm_trap_pc, config.macos_use_mach_ports);
         debug_builtins::ensure_exported();
 
         let registry = SignatureRegistry::new();
@@ -415,7 +415,6 @@ impl Engine {
             | "enable_nan_canonicalization"
             | "enable_jump_tables"
             | "enable_float"
-            | "enable_simd"
             | "enable_verifier"
             | "regalloc_checker"
             | "regalloc_verbose_logs"
@@ -630,12 +629,41 @@ impl Engine {
         code.publish()?;
         Ok(Arc::new(code))
     }
+
+    /// Detects whether the bytes provided are a precompiled object produced by
+    /// Wasmtime.
+    ///
+    /// This function will inspect the header of `bytes` to determine if it
+    /// looks like a precompiled core wasm module or a precompiled component.
+    /// This does not validate the full structure or guarantee that
+    /// deserialization will succeed, instead it helps higher-levels of the
+    /// stack make a decision about what to do next when presented with the
+    /// `bytes` as an input module.
+    ///
+    /// If the `bytes` looks like a precompiled object previously produced by
+    /// [`Module::serialize`](crate::Module::serialize),
+    /// [`Component::serialize`](crate::component::Component::serialize),
+    /// [`Engine::precompile_module`], or [`Engine::precompile_component`], then
+    /// this will return `Some(...)` indicating so. Otherwise `None` is
+    /// returned.
+    pub fn detect_precompiled(&self, bytes: &[u8]) -> Option<Precompiled> {
+        serialization::detect_precompiled(bytes)
+    }
 }
 
 impl Default for Engine {
     fn default() -> Engine {
         Engine::new(&Config::default()).unwrap()
     }
+}
+
+/// Return value from the [`Engine::detect_precompiled`] API.
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+pub enum Precompiled {
+    /// The input bytes look like a precompiled core wasm module.
+    Module,
+    /// The input bytes look like a precompiled wasm component.
+    Component,
 }
 
 #[cfg(test)]
@@ -645,7 +673,7 @@ mod tests {
         hash::{Hash, Hasher},
     };
 
-    use crate::{Config, Engine, Module, OptLevel};
+    use crate::{Config, Engine, Module, ModuleVersionStrategy, OptLevel};
 
     use anyhow::Result;
     use tempfile::TempDir;
@@ -726,5 +754,32 @@ mod tests {
         cfg.cranelift_opt_level(OptLevel::Speed);
         let opt_speed_hash = hash_for_config(&cfg);
         assert_ne!(opt_none_hash, opt_speed_hash)
+    }
+
+    #[test]
+    fn precompile_compatibility_key_accounts_for_module_version_strategy() -> Result<()> {
+        fn hash_for_config(cfg: &Config) -> u64 {
+            let engine = Engine::new(cfg).expect("Config should be valid");
+            let mut hasher = DefaultHasher::new();
+            engine.precompile_compatibility_hash().hash(&mut hasher);
+            hasher.finish()
+        }
+        let mut cfg_custom_version = Config::new();
+        cfg_custom_version.module_version(ModuleVersionStrategy::Custom("1.0.1111".to_string()))?;
+        let custom_version_hash = hash_for_config(&cfg_custom_version);
+
+        let mut cfg_default_version = Config::new();
+        cfg_default_version.module_version(ModuleVersionStrategy::WasmtimeVersion)?;
+        let default_version_hash = hash_for_config(&cfg_default_version);
+
+        let mut cfg_none_version = Config::new();
+        cfg_none_version.module_version(ModuleVersionStrategy::None)?;
+        let none_version_hash = hash_for_config(&cfg_none_version);
+
+        assert_ne!(custom_version_hash, default_version_hash);
+        assert_ne!(custom_version_hash, none_version_hash);
+        assert_ne!(default_version_hash, none_version_hash);
+
+        Ok(())
     }
 }

@@ -13,6 +13,7 @@ use cranelift_codegen::{
 };
 use cranelift_wasm::{
     DummyEnvironment, FuncEnvironment, FuncIndex, ModuleEnvironment, TargetEnvironment,
+    TypeConvert, TypeIndex, WasmHeapType,
 };
 
 pub struct ModuleEnv {
@@ -23,7 +24,7 @@ pub struct ModuleEnv {
 
 impl ModuleEnv {
     pub fn new(target_isa: &dyn TargetIsa, config: TestConfig) -> Self {
-        let inner = DummyEnvironment::new(target_isa.frontend_config(), config.debug_info);
+        let inner = DummyEnvironment::new(target_isa.frontend_config());
         Self {
             inner,
             config,
@@ -62,10 +63,6 @@ impl<'data> ModuleEnvironment<'data> for ModuleEnv {
                 ir::UserFuncName::user(0, func_index.as_u32()),
                 sig,
             );
-
-            if self.inner.debug_info {
-                func.collect_debug_info();
-            }
 
             self.inner
                 .trans
@@ -235,6 +232,12 @@ impl<'data> ModuleEnvironment<'data> for ModuleEnv {
     }
 }
 
+impl TypeConvert for ModuleEnv {
+    fn lookup_heap_type(&self, _index: TypeIndex) -> WasmHeapType {
+        todo!()
+    }
+}
+
 pub struct FuncEnv<'a> {
     pub inner: cranelift_wasm::DummyFuncEnvironment<'a>,
     pub config: TestConfig,
@@ -258,6 +261,12 @@ impl<'a> FuncEnv<'a> {
             next_heap: 0,
             heap_access_spectre_mitigation,
         }
+    }
+}
+
+impl TypeConvert for FuncEnv<'_> {
+    fn lookup_heap_type(&self, _index: TypeIndex) -> WasmHeapType {
+        todo!()
     }
 }
 
@@ -385,6 +394,38 @@ impl<'a> FuncEnvironment for FuncEnv<'a> {
             callee,
             call_args,
         )
+    }
+
+    fn translate_return_call_indirect(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        table_index: cranelift_wasm::TableIndex,
+        table: ir::Table,
+        sig_index: TypeIndex,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> cranelift_wasm::WasmResult<()> {
+        self.inner.translate_return_call_indirect(
+            builder,
+            table_index,
+            table,
+            sig_index,
+            sig_ref,
+            callee,
+            call_args,
+        )
+    }
+
+    fn translate_return_call_ref(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> cranelift_wasm::WasmResult<()> {
+        self.inner
+            .translate_return_call_ref(builder, sig_ref, callee, call_args)
     }
 
     fn translate_memory_grow(
@@ -621,5 +662,19 @@ impl<'a> FuncEnvironment for FuncEnv<'a> {
 
     fn is_x86(&self) -> bool {
         self.config.target.contains("x86_64")
+    }
+
+    fn use_x86_pmaddubsw_for_dot(&self) -> bool {
+        self.config.target.contains("x86_64")
+    }
+
+    fn translate_call_ref(
+        &mut self,
+        _builder: &mut cranelift_frontend::FunctionBuilder<'_>,
+        _ty: ir::SigRef,
+        _func: ir::Value,
+        _args: &[ir::Value],
+    ) -> cranelift_wasm::WasmResult<ir::Inst> {
+        unimplemented!()
     }
 }

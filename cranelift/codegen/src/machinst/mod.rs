@@ -144,6 +144,20 @@ pub trait MachInst: Clone + Debug {
     /// control flow.
     fn gen_jump(target: MachLabel) -> Self;
 
+    /// Generate a store of an immediate 64-bit integer to a register. Used by
+    /// the control plane to generate random instructions.
+    fn gen_imm_u64(_value: u64, _dst: Writable<Reg>) -> Option<Self> {
+        None
+    }
+
+    /// Generate a store of an immediate 64-bit integer to a register. Used by
+    /// the control plane to generate random instructions. The tmp register may
+    /// be used by architectures which don't support writing immediate values to
+    /// floating point registers directly.
+    fn gen_imm_f64(_value: f64, _tmp: Writable<Reg>, _dst: Writable<Reg>) -> SmallVec<[Self; 2]> {
+        SmallVec::new()
+    }
+
     /// Generate a NOP. The `preferred_size` parameter allows the caller to
     /// request a NOP of that size, or as close to it as possible. The machine
     /// backend may return a NOP whose binary encoding is smaller than the
@@ -220,6 +234,8 @@ pub trait MachInstLabelUse: Clone + Copy + Debug + Eq {
     fn supports_veneer(self) -> bool;
     /// How many bytes are needed for a veneer?
     fn veneer_size(self) -> CodeOffset;
+    /// What's the largest possible veneer that may be generated?
+    fn worst_case_veneer_size() -> CodeOffset;
     /// Generate a veneer. The given code-buffer slice is `self.veneer_size()`
     /// bytes long at offset `veneer_offset` in the buffer. The original
     /// label-use will be patched to refer to this veneer's offset.  A new
@@ -249,6 +265,8 @@ pub enum MachTerminator {
     None,
     /// A return instruction.
     Ret,
+    /// A tail call.
+    RetCall,
     /// An unconditional branch to another block.
     Uncond,
     /// A conditional branch to one of two other blocks.

@@ -1,7 +1,7 @@
 [package]
 authors = ["The Cranelift Project Developers"]
 name = "cranelift-codegen"
-version = "0.97.0"
+version = "0.100.0"
 description = "Low-level code generator library"
 license = "Apache-2.0 WITH LLVM-exception"
 documentation = "https://docs.rs/cranelift-codegen"
@@ -16,7 +16,7 @@ edition.workspace = true
 anyhow = { workspace = true, optional = true }
 bumpalo = "3"
 capstone = { workspace = true, optional = true }
-cranelift-codegen-shared = { path = "./shared", version = "0.97.0" }
+cranelift-codegen-shared = { path = "./shared", version = "0.100.0" }
 cranelift-entity = { workspace = true }
 cranelift-bforest = { workspace = true }
 cranelift-control = { workspace = true }
@@ -36,15 +36,15 @@ sha2 = { version = "0.10.2", optional = true }
 # accomodated in `tests`.
 
 [dev-dependencies]
-criterion = { version = "0.4.0", features = ["html_reports"] }
+criterion = { version = "0.5.0", features = ["html_reports"] }
 similar = "2.1.0"
 
 [build-dependencies]
-cranelift-codegen-meta = { path = "meta", version = "0.97.0" }
-cranelift-isle = { path = "../isle/isle", version = "=0.97.0" }
+cranelift-codegen-meta = { path = "meta", version = "0.100.0" }
+cranelift-isle = { path = "../isle/isle", version = "=0.100.0" }
 
 [features]
-default = ["std", "unwind", "trace-log"]
+default = ["std", "unwind", "host-arch"]
 
 # The "std" feature enables use of libstd. The "core" feature enables use
 # of some minimal std-like replacement libraries. At least one of these two
@@ -61,10 +61,6 @@ core = []
 # context, and the `disassemble` method on `MachBufferFinalized`.
 disas = ["anyhow", "capstone"]
 
-# This enables some additional functions useful for writing tests, but which
-# can significantly increase the size of the library.
-testing_hooks = []
-
 # Enables detailed logging which can be somewhat expensive.
 trace-log = []
 
@@ -77,6 +73,8 @@ x86 = []
 arm64 = []
 s390x = []
 riscv64 = []
+# Enable the ISA target for the host machine
+host-arch = []
 
 # Option to enable all architectures.
 all-arch = [

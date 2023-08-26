@@ -19,6 +19,18 @@ use target_lexicon::Triple;
 //=============================================================================
 // Helpers for instruction lowering.
 
+impl Lower<'_, Inst> {
+    #[inline]
+    pub fn temp_writable_gpr(&mut self) -> WritableGpr {
+        WritableGpr::from_writable_reg(self.alloc_tmp(types::I64).only_reg().unwrap()).unwrap()
+    }
+
+    #[inline]
+    pub fn temp_writable_xmm(&mut self) -> WritableXmm {
+        WritableXmm::from_writable_reg(self.alloc_tmp(types::F64).only_reg().unwrap()).unwrap()
+    }
+}
+
 fn is_int_or_ref_ty(ty: Type) -> bool {
     match ty {
         types::I8 | types::I16 | types::I32 | types::I64 | types::R64 => true,
@@ -159,7 +171,7 @@ fn emit_vm_call(
     }
 
     let mut abi =
-        X64CallSite::from_libcall(ctx.sigs(), &sig, &extname, dist, caller_conv, flags.clone())?;
+        X64CallSite::from_libcall(ctx.sigs(), &sig, &extname, dist, caller_conv, flags.clone());
 
     abi.emit_stack_pre_adjust(ctx);
 
@@ -266,9 +278,9 @@ fn lower_to_amode(ctx: &mut Lower<Inst>, spec: InsnInput, offset: i32) -> Amode 
                         let uext_cst: u64 = (cst << shift) >> shift;
 
                         let final_offset = (offset as i64).wrapping_add(uext_cst as i64);
-                        if low32_will_sign_extend_to_64(final_offset as u64) {
+                        if let Ok(final_offset) = i32::try_from(final_offset) {
                             let base = put_input_in_reg(ctx, add_inputs[1 - i]);
-                            return Amode::imm_reg(final_offset as u32, base).with_flags(flags);
+                            return Amode::imm_reg(final_offset, base).with_flags(flags);
                         }
                     }
                 }
@@ -276,9 +288,9 @@ fn lower_to_amode(ctx: &mut Lower<Inst>, spec: InsnInput, offset: i32) -> Amode 
                 // If it's a constant, add it directly!
                 if let Some(cst) = ctx.get_input_as_source_or_const(add, i).constant {
                     let final_offset = (offset as i64).wrapping_add(cst as i64);
-                    if low32_will_sign_extend_to_64(final_offset as u64) {
+                    if let Ok(final_offset) = i32::try_from(final_offset) {
                         let base = put_input_in_reg(ctx, add_inputs[1 - i]);
-                        return Amode::imm_reg(final_offset as u32, base).with_flags(flags);
+                        return Amode::imm_reg(final_offset, base).with_flags(flags);
                     }
                 }
             }
@@ -291,7 +303,7 @@ fn lower_to_amode(ctx: &mut Lower<Inst>, spec: InsnInput, offset: i32) -> Amode 
         };
 
         return Amode::imm_reg_reg_shift(
-            offset as u32,
+            offset,
             Gpr::new(base).unwrap(),
             Gpr::new(index).unwrap(),
             shift,
@@ -300,7 +312,7 @@ fn lower_to_amode(ctx: &mut Lower<Inst>, spec: InsnInput, offset: i32) -> Amode 
     }
 
     let input = put_input_in_reg(ctx, spec);
-    Amode::imm_reg(offset as u32, input).with_flags(flags)
+    Amode::imm_reg(offset, input).with_flags(flags)
 }
 
 //=============================================================================

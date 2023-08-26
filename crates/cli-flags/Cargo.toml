@@ -11,8 +11,8 @@ edition.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-file-per-thread-logger = "0.1.1"
-pretty_env_logger = "0.4.0"
+file-per-thread-logger = { workspace = true }
+pretty_env_logger = { workspace = true }
 rayon = "1.5.0"
 wasmtime = { workspace = true }
 
@@ -25,4 +25,4 @@ default = [
     "wasmtime/parallel-compilation",
 ]
 pooling-allocator = []
-component-model = []
+component-model = ["wasmtime/component-model"]

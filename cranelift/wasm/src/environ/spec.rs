@@ -9,13 +9,13 @@
 use crate::state::FuncTranslationState;
 use crate::{
     DataIndex, ElemIndex, FuncIndex, Global, GlobalIndex, GlobalInit, Heap, HeapData, Memory,
-    MemoryIndex, SignatureIndex, Table, TableIndex, Tag, TagIndex, TypeIndex, WasmError,
-    WasmFuncType, WasmResult, WasmType,
+    MemoryIndex, SignatureIndex, Table, TableIndex, Tag, TagIndex, TypeConvert, TypeIndex,
+    WasmError, WasmFuncType, WasmHeapType, WasmResult,
 };
 use core::convert::From;
 use cranelift_codegen::cursor::FuncCursor;
 use cranelift_codegen::ir::immediates::Offset32;
-use cranelift_codegen::ir::{self, InstBuilder};
+use cranelift_codegen::ir::{self, InstBuilder, Type};
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_entity::PrimaryMap;
 use cranelift_frontend::FunctionBuilder;
@@ -44,7 +44,7 @@ pub enum GlobalVariable {
 }
 
 /// Environment affecting the translation of a WebAssembly.
-pub trait TargetEnvironment {
+pub trait TargetEnvironment: TypeConvert {
     /// Get the information needed to produce Cranelift IR for the given target.
     fn target_config(&self) -> TargetFrontendConfig;
 
@@ -70,7 +70,7 @@ pub trait TargetEnvironment {
     /// 32-bit architectures. If you override this, then you should also
     /// override `FuncEnvironment::{translate_ref_null, translate_ref_is_null}`
     /// as well.
-    fn reference_type(&self, ty: WasmType) -> ir::Type {
+    fn reference_type(&self, ty: WasmHeapType) -> ir::Type {
         let _ = ty;
         match self.pointer_type() {
             ir::types::I32 => ir::types::R32,
@@ -170,6 +170,23 @@ pub trait FuncEnvironment: TargetEnvironment {
         index: FuncIndex,
     ) -> WasmResult<ir::FuncRef>;
 
+    /// Translate a `call` WebAssembly instruction at `pos`.
+    ///
+    /// Insert instructions at `pos` for a direct call to the function `callee_index`.
+    ///
+    /// The function reference `callee` was previously created by `make_direct_func()`.
+    ///
+    /// Return the call instruction whose results are the WebAssembly return values.
+    fn translate_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        _callee_index: FuncIndex,
+        callee: ir::FuncRef,
+        call_args: &[ir::Value],
+    ) -> WasmResult<ir::Inst> {
+        Ok(builder.ins().call(callee, call_args))
+    }
+
     /// Translate a `call_indirect` WebAssembly instruction at `pos`.
     ///
     /// Insert instructions at `pos` for an indirect call to the function `callee` in the table
@@ -191,22 +208,82 @@ pub trait FuncEnvironment: TargetEnvironment {
         call_args: &[ir::Value],
     ) -> WasmResult<ir::Inst>;
 
-    /// Translate a `call` WebAssembly instruction at `pos`.
+    /// Translate a `return_call` WebAssembly instruction at the builder's
+    /// current position.
     ///
-    /// Insert instructions at `pos` for a direct call to the function `callee_index`.
+    /// Insert instructions at the builder's current position for a direct tail
+    /// call to the function `callee_index`.
     ///
     /// The function reference `callee` was previously created by `make_direct_func()`.
     ///
     /// Return the call instruction whose results are the WebAssembly return values.
-    fn translate_call(
+    fn translate_return_call(
         &mut self,
-        mut pos: FuncCursor,
+        builder: &mut FunctionBuilder,
         _callee_index: FuncIndex,
         callee: ir::FuncRef,
         call_args: &[ir::Value],
-    ) -> WasmResult<ir::Inst> {
-        Ok(pos.ins().call(callee, call_args))
+    ) -> WasmResult<()> {
+        builder.ins().return_call(callee, call_args);
+        Ok(())
     }
+
+    /// Translate a `return_call_indirect` WebAssembly instruction at the
+    /// builder's current position.
+    ///
+    /// Insert instructions at the builder's current position for an indirect
+    /// tail call to the function `callee` in the table `table_index` with
+    /// WebAssembly signature `sig_index`. The `callee` value will have type
+    /// `i32`.
+    ///
+    /// The signature `sig_ref` was previously created by `make_indirect_sig()`.
+    #[allow(clippy::too_many_arguments)]
+    fn translate_return_call_indirect(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        table_index: TableIndex,
+        table: ir::Table,
+        sig_index: TypeIndex,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> WasmResult<()>;
+
+    /// Translate a `return_call_ref` WebAssembly instruction at the builder's
+    /// given position.
+    ///
+    /// Insert instructions at the builder's current position for an indirect
+    /// tail call to the function `callee`. The `callee` value will be a Wasm
+    /// funcref that may need to be translated to a native function address
+    /// depending on your implementation of this trait.
+    ///
+    /// The signature `sig_ref` was previously created by `make_indirect_sig()`.
+    fn translate_return_call_ref(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> WasmResult<()>;
+
+    /// Translate a `call_ref` WebAssembly instruction at the builder's current
+    /// position.
+    ///
+    /// Insert instructions at the builder's current position for an indirect
+    /// call to the function `callee`. The `callee` value will be a Wasm funcref
+    /// that may need to be translated to a native function address depending on
+    /// your implementation of this trait.
+    ///
+    /// The signature `sig_ref` was previously created by `make_indirect_sig()`.
+    ///
+    /// Return the call instruction whose results are the WebAssembly return values.
+    fn translate_call_ref(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        sig_ref: ir::SigRef,
+        callee: ir::Value,
+        call_args: &[ir::Value],
+    ) -> WasmResult<ir::Inst>;
 
     /// Translate a `memory.grow` WebAssembly instruction.
     ///
@@ -373,7 +450,11 @@ pub trait FuncEnvironment: TargetEnvironment {
     /// null sentinel is not a null reference type pointer for your type. If you
     /// override this method, then you should also override
     /// `translate_ref_is_null` as well.
-    fn translate_ref_null(&mut self, mut pos: FuncCursor, ty: WasmType) -> WasmResult<ir::Value> {
+    fn translate_ref_null(
+        &mut self,
+        mut pos: FuncCursor,
+        ty: WasmHeapType,
+    ) -> WasmResult<ir::Value> {
         let _ = ty;
         Ok(pos.ins().null(self.reference_type(ty)))
     }
@@ -542,12 +623,78 @@ pub trait FuncEnvironment: TargetEnvironment {
     fn is_x86(&self) -> bool {
         false
     }
+
+    /// Returns whether the CLIF `x86_blendv` instruction should be used for the
+    /// relaxed simd `*.relaxed_laneselect` instruction for the specified type.
+    fn use_x86_blendv_for_relaxed_laneselect(&self, ty: Type) -> bool {
+        let _ = ty;
+        false
+    }
+
+    /// Returns whether the CLIF `x86_pshufb` instruction should be used for the
+    /// `i8x16.relaxed_swizzle` instruction.
+    fn use_x86_pshufb_for_relaxed_swizzle(&self) -> bool {
+        false
+    }
+
+    /// Returns whether the CLIF `x86_pmulhrsw` instruction should be used for
+    /// the `i8x16.relaxed_q15mulr_s` instruction.
+    fn use_x86_pmulhrsw_for_relaxed_q15mul(&self) -> bool {
+        false
+    }
+
+    /// Returns whether the CLIF `x86_pmaddubsw` instruction should be used for
+    /// the relaxed-simd dot-product instructions instruction.
+    fn use_x86_pmaddubsw_for_dot(&self) -> bool {
+        false
+    }
+
+    /// Inserts code before a function return.
+    fn handle_before_return(&mut self, _retvals: &[ir::Value], _builder: &mut FunctionBuilder) {}
+
+    /// Inserts code before a load.
+    fn before_load(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _val_size: u8,
+        _addr: ir::Value,
+        _offset: u64,
+    ) {
+    }
+
+    /// Inserts code before a store.
+    fn before_store(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _val_size: u8,
+        _addr: ir::Value,
+        _offset: u64,
+    ) {
+    }
+
+    /// Inserts code before updating a global.
+    fn update_global(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _global_index: u32,
+        _value: ir::Value,
+    ) {
+    }
+
+    /// Inserts code before memory.grow.
+    fn before_memory_grow(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _num_bytes: ir::Value,
+        _mem_index: MemoryIndex,
+    ) {
+    }
 }
 
 /// An object satisfying the `ModuleEnvironment` trait can be passed as argument to the
 /// [`translate_module`](fn.translate_module.html) function. These methods should not be called
 /// by the user, they are only for `cranelift-wasm` internal use.
-pub trait ModuleEnvironment<'data> {
+pub trait ModuleEnvironment<'data>: TypeConvert {
     /// Provides the number of types up front. By default this does nothing, but
     /// implementations can use this to preallocate memory if desired.
     fn reserve_types(&mut self, _num: u32) -> WasmResult<()> {

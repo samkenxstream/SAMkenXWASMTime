@@ -1,14 +1,15 @@
 use crate::binemit::{Addend, Reloc};
+use crate::ir;
 use crate::ir::immediates::{Ieee32, Ieee64};
 use crate::ir::TrapCode;
-use crate::ir::{KnownSymbol, LibCall};
-use crate::isa::x64::encoding::evex::{EvexInstruction, EvexVectorLength};
+use crate::ir::{KnownSymbol, LibCall, MemFlags};
+use crate::isa::x64::encoding::evex::{EvexInstruction, EvexVectorLength, RegisterOrAmode};
 use crate::isa::x64::encoding::rex::{
     emit_simm, emit_std_enc_enc, emit_std_enc_mem, emit_std_reg_mem, emit_std_reg_reg, int_reg_enc,
     low8_will_sign_extend_to_32, low8_will_sign_extend_to_64, reg_enc, LegacyPrefixes, OpcodeMap,
     RexFlags,
 };
-use crate::isa::x64::encoding::vex::{RegisterOrAmode, VexInstruction, VexVectorLength};
+use crate::isa::x64::encoding::vex::{VexInstruction, VexVectorLength};
 use crate::isa::x64::inst::args::*;
 use crate::isa::x64::inst::*;
 use crate::machinst::{inst_common, MachBuffer, MachInstEmit, MachLabel, Reg, Writable};
@@ -419,6 +420,31 @@ pub(crate) fn emit(
             }
         }
 
+        Inst::UnaryRmRVex { size, op, src, dst } => {
+            let dst = allocs.next(dst.to_reg().to_reg());
+            let src = match src.clone().to_reg_mem().with_allocs(allocs) {
+                RegMem::Reg { reg } => {
+                    RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
+                }
+                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+            };
+
+            let (opcode, opcode_ext) = match op {
+                UnaryRmRVexOpcode::Blsr => (0xF3, 1),
+                UnaryRmRVexOpcode::Blsmsk => (0xF3, 2),
+                UnaryRmRVexOpcode::Blsi => (0xF3, 3),
+            };
+
+            VexInstruction::new()
+                .map(OpcodeMap::_0F38)
+                .w(*size == OperandSize::Size64)
+                .opcode(opcode)
+                .reg(opcode_ext)
+                .vvvv(dst.to_real_reg().unwrap().hw_enc())
+                .rm(src)
+                .encode(sink);
+        }
+
         Inst::Not { size, src, dst } => {
             let src = allocs.next(src.to_reg());
             let dst = allocs.next(dst.to_reg().to_reg());
@@ -712,7 +738,7 @@ pub(crate) fn emit(
 
             // Here the `idiv` is executed, which is different depending on the
             // size
-            sink.bind_label(do_op, &mut state.ctrl_plane);
+            sink.bind_label(do_op, state.ctrl_plane_mut());
             let inst = match size {
                 OperandSize::Size8 => Inst::div8(
                     DivSignedness::Signed,
@@ -734,7 +760,7 @@ pub(crate) fn emit(
             };
             inst.emit(&[], sink, info, state);
 
-            sink.bind_label(done_label, &mut state.ctrl_plane);
+            sink.bind_label(done_label, state.ctrl_plane_mut());
         }
 
         Inst::Imm {
@@ -959,7 +985,7 @@ pub(crate) fn emit(
                     let inst = Inst::alu_rmi_r(
                         *size,
                         AluRmiROpcode::Add,
-                        RegMemImm::imm(simm32),
+                        RegMemImm::imm(simm32 as u32),
                         Writable::from_reg(dst),
                     );
                     inst.emit(&[], sink, info, state);
@@ -1383,7 +1409,7 @@ pub(crate) fn emit(
             let inst = Inst::xmm_unary_rm_r(op, consequent, Writable::from_reg(dst));
             inst.emit(&[], sink, info, state);
 
-            sink.bind_label(next, &mut state.ctrl_plane);
+            sink.bind_label(next, state.ctrl_plane_mut());
         }
 
         Inst::Push64 { src } => {
@@ -1487,7 +1513,7 @@ pub(crate) fn emit(
 
             // Emit the main loop!
             let loop_start = sink.get_label();
-            sink.bind_label(loop_start, &mut state.ctrl_plane);
+            sink.bind_label(loop_start, state.ctrl_plane_mut());
 
             // sub  rsp, GUARD_SIZE
             let inst = Inst::alu_rmi_r(
@@ -1554,6 +1580,62 @@ pub(crate) fn emit(
             if call_info.opcode.is_call() {
                 sink.add_call_site(call_info.opcode);
             }
+
+            let callee_pop_size = i64::from(call_info.callee_pop_size);
+            state.adjust_virtual_sp_offset(-callee_pop_size);
+        }
+
+        Inst::ReturnCallKnown {
+            callee,
+            info: call_info,
+        } => {
+            emit_return_call_common_sequence(
+                allocs,
+                sink,
+                info,
+                state,
+                call_info.new_stack_arg_size,
+                call_info.old_stack_arg_size,
+                call_info.ret_addr,
+                call_info.fp,
+                call_info.tmp,
+                &call_info.uses,
+            );
+
+            // Finally, jump to the callee!
+            //
+            // Note: this is not `Inst::Jmp { .. }.emit(..)` because we have
+            // different metadata in this case: we don't have a label for the
+            // target, but rather a function relocation.
+            sink.put1(0xE9);
+            // The addend adjusts for the difference between the end of the instruction and the
+            // beginning of the immediate field.
+            emit_reloc(sink, Reloc::X86CallPCRel4, &callee, -4);
+            sink.put4(0);
+            sink.add_call_site(ir::Opcode::ReturnCall);
+        }
+
+        Inst::ReturnCallUnknown {
+            callee,
+            info: call_info,
+        } => {
+            let callee = callee.with_allocs(allocs);
+
+            emit_return_call_common_sequence(
+                allocs,
+                sink,
+                info,
+                state,
+                call_info.new_stack_arg_size,
+                call_info.old_stack_arg_size,
+                call_info.ret_addr,
+                call_info.fp,
+                call_info.tmp,
+                &call_info.uses,
+            );
+
+            Inst::JmpUnknown { target: callee }.emit(&[], sink, info, state);
+            sink.add_call_site(ir::Opcode::ReturnCallIndirect);
         }
 
         Inst::CallUnknown {
@@ -1598,11 +1680,24 @@ pub(crate) fn emit(
             if call_info.opcode.is_call() {
                 sink.add_call_site(call_info.opcode);
             }
+
+            let callee_pop_size = i64::from(call_info.callee_pop_size);
+            state.adjust_virtual_sp_offset(-callee_pop_size);
         }
 
         Inst::Args { .. } => {}
 
-        Inst::Ret { .. } => sink.put1(0xC3),
+        Inst::Ret {
+            stack_bytes_to_pop: 0,
+            ..
+        } => sink.put1(0xC3),
+
+        Inst::Ret {
+            stack_bytes_to_pop, ..
+        } => {
+            sink.put1(0xC2);
+            sink.put2(u16::try_from(*stack_bytes_to_pop).unwrap());
+        }
 
         Inst::JmpKnown { dst } => {
             let br_start = sink.cur_offset();
@@ -1758,7 +1853,7 @@ pub(crate) fn emit(
             inst.emit(&[], sink, info, state);
 
             // Emit jump table (table of 32-bit offsets).
-            sink.bind_label(start_of_jumptable, &mut state.ctrl_plane);
+            sink.bind_label(start_of_jumptable, state.ctrl_plane_mut());
             let jt_off = sink.cur_offset();
             for &target in targets.iter().chain(std::iter::once(default_target)) {
                 let word_off = sink.cur_offset();
@@ -1790,7 +1885,7 @@ pub(crate) fn emit(
             one_way_jmp(sink, cc1.invert(), else_label);
             one_way_jmp(sink, *cc2, trap_label);
 
-            sink.bind_label(else_label, &mut state.ctrl_plane);
+            sink.bind_label(else_label, state.ctrl_plane_mut());
         }
 
         Inst::TrapIfOr {
@@ -1910,7 +2005,12 @@ pub(crate) fn emit(
 
         Inst::XmmUnaryRmREvex { op, src, dst } => {
             let dst = allocs.next(dst.to_reg().to_reg());
-            let src = src.clone().to_reg_mem().with_allocs(allocs);
+            let src = match src.clone().to_reg_mem().with_allocs(allocs) {
+                RegMem::Reg { reg } => {
+                    RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
+                }
+                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+            };
 
             let (prefix, map, w, opcode) = match op {
                 Avx512Opcode::Vcvtudq2ps => (LegacyPrefixes::_F2, OpcodeMap::_0F, false, 0x7a),
@@ -1918,18 +2018,43 @@ pub(crate) fn emit(
                 Avx512Opcode::Vpopcntb => (LegacyPrefixes::_66, OpcodeMap::_0F38, false, 0x54),
                 _ => unimplemented!("Opcode {:?} not implemented", op),
             };
-            match src {
-                RegMem::Reg { reg: src } => EvexInstruction::new()
-                    .length(EvexVectorLength::V128)
-                    .prefix(prefix)
-                    .map(map)
-                    .w(w)
-                    .opcode(opcode)
-                    .reg(dst.to_real_reg().unwrap().hw_enc())
-                    .rm(src.to_real_reg().unwrap().hw_enc())
-                    .encode(sink),
-                _ => todo!(),
+            EvexInstruction::new()
+                .length(EvexVectorLength::V128)
+                .prefix(prefix)
+                .map(map)
+                .w(w)
+                .opcode(opcode)
+                .tuple_type(op.tuple_type())
+                .reg(dst.to_real_reg().unwrap().hw_enc())
+                .rm(src)
+                .encode(sink);
+        }
+
+        Inst::XmmUnaryRmRImmEvex { op, src, dst, imm } => {
+            let dst = allocs.next(dst.to_reg().to_reg());
+            let src = match src.clone().to_reg_mem().with_allocs(allocs) {
+                RegMem::Reg { reg } => {
+                    RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
+                }
+                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
             };
+
+            let (opcode, opcode_ext, w) = match op {
+                Avx512Opcode::VpsraqImm => (0x72, 4, true),
+                _ => unimplemented!("Opcode {:?} not implemented", op),
+            };
+            EvexInstruction::new()
+                .length(EvexVectorLength::V128)
+                .prefix(LegacyPrefixes::_66)
+                .map(OpcodeMap::_0F)
+                .w(w)
+                .opcode(opcode)
+                .reg(opcode_ext)
+                .vvvvv(dst.to_real_reg().unwrap().hw_enc())
+                .tuple_type(op.tuple_type())
+                .rm(src)
+                .imm(*imm)
+                .encode(sink);
         }
 
         Inst::XmmRmR {
@@ -2732,38 +2857,44 @@ pub(crate) fn emit(
         }
         | Inst::XmmRmREvex3 {
             op,
-            src1,
-            src2,
+            src1: _, // `dst` reuses `src1`.
+            src2: src1,
+            src3: src2,
             dst,
-            // `dst` reuses `src3`.
-            ..
         } => {
+            let reused_src = match inst {
+                Inst::XmmRmREvex3 { src1, .. } => Some(allocs.next(src1.to_reg())),
+                _ => None,
+            };
+            let src1 = allocs.next(src1.to_reg());
+            let src2 = match src2.clone().to_reg_mem().with_allocs(allocs) {
+                RegMem::Reg { reg } => {
+                    RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
+                }
+                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+            };
             let dst = allocs.next(dst.to_reg().to_reg());
-            let src2 = allocs.next(src2.to_reg());
-            if let Inst::XmmRmREvex3 { src3, .. } = inst {
-                let src3 = allocs.next(src3.to_reg());
-                debug_assert_eq!(src3, dst);
+            if let Some(src1) = reused_src {
+                debug_assert_eq!(src1, dst);
             }
-            let src1 = src1.clone().to_reg_mem().with_allocs(allocs);
 
-            let (w, opcode) = match op {
-                Avx512Opcode::Vpermi2b => (false, 0x75),
-                Avx512Opcode::Vpmullq => (true, 0x40),
+            let (w, opcode, map) = match op {
+                Avx512Opcode::Vpermi2b => (false, 0x75, OpcodeMap::_0F38),
+                Avx512Opcode::Vpmullq => (true, 0x40, OpcodeMap::_0F38),
+                Avx512Opcode::Vpsraq => (true, 0xE2, OpcodeMap::_0F),
                 _ => unimplemented!("Opcode {:?} not implemented", op),
             };
-            match src1 {
-                RegMem::Reg { reg: src } => EvexInstruction::new()
-                    .length(EvexVectorLength::V128)
-                    .prefix(LegacyPrefixes::_66)
-                    .map(OpcodeMap::_0F38)
-                    .w(w)
-                    .opcode(opcode)
-                    .reg(dst.to_real_reg().unwrap().hw_enc())
-                    .rm(src.to_real_reg().unwrap().hw_enc())
-                    .vvvvv(src2.to_real_reg().unwrap().hw_enc())
-                    .encode(sink),
-                _ => todo!(),
-            };
+            EvexInstruction::new()
+                .length(EvexVectorLength::V128)
+                .prefix(LegacyPrefixes::_66)
+                .map(map)
+                .w(w)
+                .opcode(opcode)
+                .tuple_type(op.tuple_type())
+                .reg(dst.to_real_reg().unwrap().hw_enc())
+                .vvvvv(src1.to_real_reg().unwrap().hw_enc())
+                .rm(src2)
+                .encode(sink);
         }
 
         Inst::XmmMinMaxSeq {
@@ -2846,18 +2977,18 @@ pub(crate) fn emit(
             // x86's min/max are not symmetric; if either operand is a NaN, they return the
             // read-only operand: perform an addition between the two operands, which has the
             // desired NaN propagation effects.
-            sink.bind_label(propagate_nan, &mut state.ctrl_plane);
+            sink.bind_label(propagate_nan, state.ctrl_plane_mut());
             let inst = Inst::xmm_rm_r(add_op, RegMem::reg(lhs), Writable::from_reg(dst));
             inst.emit(&[], sink, info, state);
 
             one_way_jmp(sink, CC::P, done);
 
-            sink.bind_label(do_min_max, &mut state.ctrl_plane);
+            sink.bind_label(do_min_max, state.ctrl_plane_mut());
 
             let inst = Inst::xmm_rm_r(min_max_op, RegMem::reg(lhs), Writable::from_reg(dst));
             inst.emit(&[], sink, info, state);
 
-            sink.bind_label(done, &mut state.ctrl_plane);
+            sink.bind_label(done, state.ctrl_plane_mut());
         }
 
         Inst::XmmRmRImm {
@@ -3124,7 +3255,7 @@ pub(crate) fn emit(
             let inst = Inst::jmp_known(done);
             inst.emit(&[], sink, info, state);
 
-            sink.bind_label(handle_negative, &mut state.ctrl_plane);
+            sink.bind_label(handle_negative, state.ctrl_plane_mut());
 
             // Divide x by two to get it in range for the signed conversion, keep the LSB, and
             // scale it back up on the FP side.
@@ -3177,7 +3308,7 @@ pub(crate) fn emit(
             let inst = Inst::xmm_rm_r(add_op, RegMem::reg(dst), Writable::from_reg(dst));
             inst.emit(&[], sink, info, state);
 
-            sink.bind_label(done, &mut state.ctrl_plane);
+            sink.bind_label(done, state.ctrl_plane_mut());
         }
 
         Inst::CvtFloatToSintSeq {
@@ -3279,7 +3410,7 @@ pub(crate) fn emit(
                 let inst = Inst::jmp_known(done);
                 inst.emit(&[], sink, info, state);
 
-                sink.bind_label(not_nan, &mut state.ctrl_plane);
+                sink.bind_label(not_nan, state.ctrl_plane_mut());
 
                 // If the input was positive, saturate to INT_MAX.
 
@@ -3377,7 +3508,7 @@ pub(crate) fn emit(
                 inst.emit(&[], sink, info, state);
             }
 
-            sink.bind_label(done, &mut state.ctrl_plane);
+            sink.bind_label(done, state.ctrl_plane_mut());
         }
 
         Inst::CvtFloatToUintSeq {
@@ -3487,7 +3618,7 @@ pub(crate) fn emit(
 
                 let inst = Inst::jmp_known(done);
                 inst.emit(&[], sink, info, state);
-                sink.bind_label(not_nan, &mut state.ctrl_plane);
+                sink.bind_label(not_nan, state.ctrl_plane_mut());
             } else {
                 // Trap.
                 let inst = Inst::trap_if(CC::P, TrapCode::BadConversionToInteger);
@@ -3526,7 +3657,7 @@ pub(crate) fn emit(
 
             // Now handle large inputs.
 
-            sink.bind_label(handle_large, &mut state.ctrl_plane);
+            sink.bind_label(handle_large, state.ctrl_plane_mut());
 
             let inst = Inst::gen_move(Writable::from_reg(tmp_xmm2), src, types::F64);
             inst.emit(&[], sink, info, state);
@@ -3559,7 +3690,7 @@ pub(crate) fn emit(
 
                 let inst = Inst::jmp_known(done);
                 inst.emit(&[], sink, info, state);
-                sink.bind_label(next_is_large, &mut state.ctrl_plane);
+                sink.bind_label(next_is_large, state.ctrl_plane_mut());
             } else {
                 let inst = Inst::trap_if(CC::L, TrapCode::IntegerOverflow);
                 inst.emit(&[], sink, info, state);
@@ -3586,7 +3717,7 @@ pub(crate) fn emit(
                 inst.emit(&[], sink, info, state);
             }
 
-            sink.bind_label(done, &mut state.ctrl_plane);
+            sink.bind_label(done, state.ctrl_plane_mut());
         }
 
         Inst::LoadExtName {
@@ -3711,7 +3842,7 @@ pub(crate) fn emit(
             i1.emit(&[], sink, info, state);
 
             // again:
-            sink.bind_label(again_label, &mut state.ctrl_plane);
+            sink.bind_label(again_label, state.ctrl_plane_mut());
 
             // movq %rax, %r_temp
             let i2 = Inst::mov_r_r(OperandSize::Size64, dst_old.to_reg(), temp);
@@ -3813,12 +3944,7 @@ pub(crate) fn emit(
         }
 
         Inst::VirtualSPOffsetAdj { offset } => {
-            trace!(
-                "virtual sp offset adjusted by {} -> {}",
-                offset,
-                state.virtual_sp_offset + offset
-            );
-            state.virtual_sp_offset += offset;
+            state.adjust_virtual_sp_offset(*offset);
         }
 
         Inst::Nop { len } => {
@@ -4016,4 +4142,159 @@ pub(crate) fn emit(
     }
 
     state.clear_post_insn();
+}
+
+/// Emit the common sequence used for both direct and indirect tail calls:
+///
+/// * Copy the new frame's stack arguments over the top of our current frame.
+///
+/// * Restore the old frame pointer.
+///
+/// * Initialize the tail callee's stack pointer (simultaneously deallocating
+///   the temporary stack space we allocated when creating the new frame's stack
+///   arguments).
+///
+/// * Move the return address into its stack slot.
+fn emit_return_call_common_sequence(
+    allocs: &mut AllocationConsumer<'_>,
+    sink: &mut MachBuffer<Inst>,
+    info: &EmitInfo,
+    state: &mut EmitState,
+    new_stack_arg_size: u32,
+    old_stack_arg_size: u32,
+    ret_addr: Option<Gpr>,
+    fp: Gpr,
+    tmp: WritableGpr,
+    uses: &CallArgList,
+) {
+    assert!(
+        info.flags.preserve_frame_pointers(),
+        "frame pointers aren't fundamentally required for tail calls, \
+                 but the current implementation relies on them being present"
+    );
+
+    for u in uses {
+        let _ = allocs.next(u.vreg);
+    }
+
+    let ret_addr = ret_addr.map(|r| Gpr::new(allocs.next(*r)).unwrap());
+
+    let fp = allocs.next(*fp);
+
+    let tmp = allocs.next(tmp.to_reg().to_reg());
+    let tmp = Gpr::new(tmp).unwrap();
+    let tmp_w = WritableGpr::from_reg(tmp);
+
+    // Copy the new frame (which is `frame_size` bytes above the SP)
+    // onto our current frame, using only volatile, non-argument
+    // registers.
+    //
+    //
+    // The current stack layout is the following:
+    //
+    //            | ...                 |
+    //            +---------------------+
+    //            | ...                 |
+    //            | stack arguments     |
+    //            | ...                 |
+    //    current | return address      |
+    //    frame   | old FP              | <-- FP
+    //            | ...                 |
+    //            | old stack slots     |
+    //            | ...                 |
+    //            +---------------------+
+    //            | ...                 |
+    //    new     | new stack arguments |
+    //    frame   | ...                 | <-- SP
+    //            +---------------------+
+    //
+    // We need to restore the old FP, copy the new stack arguments over the old
+    // stack arguments, write the return address into the correct slot just
+    // after the new stack arguments, adjust SP to point to the new return
+    // address, and then jump to the callee (which will push the old FP again).
+
+    // Restore the old FP into `rbp`.
+    Inst::Mov64MR {
+        src: SyntheticAmode::Real(Amode::ImmReg {
+            simm32: 0,
+            base: fp,
+            flags: MemFlags::trusted(),
+        }),
+        dst: Writable::from_reg(Gpr::new(regs::rbp()).unwrap()),
+    }
+    .emit(&[], sink, info, state);
+
+    // The new lowest address (top of stack) -- relative to FP -- for
+    // our tail callee. We compute this now so that we can move our
+    // stack arguments into place.
+    let callee_sp_relative_to_fp = i64::from(old_stack_arg_size) - i64::from(new_stack_arg_size);
+
+    // Copy over each word, using `tmp` as a temporary register.
+    //
+    // Note that we have to do this from stack slots with the highest
+    // address to lowest address because in the case of when the tail
+    // callee has more stack arguments than we do, we might otherwise
+    // overwrite some of our stack arguments before they've been copied
+    // into place.
+    assert_eq!(
+        new_stack_arg_size % 8,
+        0,
+        "stack argument space sizes should always be 8-byte aligned"
+    );
+    for i in (0..new_stack_arg_size / 8).rev() {
+        Inst::Mov64MR {
+            src: SyntheticAmode::Real(Amode::ImmReg {
+                simm32: (i * 8).try_into().unwrap(),
+                base: regs::rsp(),
+                flags: MemFlags::trusted(),
+            }),
+            dst: tmp_w,
+        }
+        .emit(&[], sink, info, state);
+        Inst::MovRM {
+            size: OperandSize::Size64,
+            src: tmp,
+            dst: SyntheticAmode::Real(Amode::ImmReg {
+                // Add 2 because we need to skip over the old FP and the
+                // return address.
+                simm32: (callee_sp_relative_to_fp + i64::from((i + 2) * 8))
+                    .try_into()
+                    .unwrap(),
+                base: fp,
+                flags: MemFlags::trusted(),
+            }),
+        }
+        .emit(&[], sink, info, state);
+    }
+
+    // Initialize SP for the tail callee, deallocating the temporary
+    // stack arguments space at the same time.
+    Inst::LoadEffectiveAddress {
+        size: OperandSize::Size64,
+        addr: SyntheticAmode::Real(Amode::ImmReg {
+            // NB: We add a word to `callee_sp_relative_to_fp` here because the
+            // callee will push FP, not us.
+            simm32: callee_sp_relative_to_fp.wrapping_add(8).try_into().unwrap(),
+            base: fp,
+            flags: MemFlags::trusted(),
+        }),
+        dst: Writable::from_reg(Gpr::new(regs::rsp()).unwrap()),
+    }
+    .emit(&[], sink, info, state);
+
+    state.adjust_virtual_sp_offset(-i64::from(new_stack_arg_size));
+
+    // Write the return address into the correct stack slot.
+    if let Some(ret_addr) = ret_addr {
+        Inst::MovRM {
+            size: OperandSize::Size64,
+            src: ret_addr,
+            dst: SyntheticAmode::Real(Amode::ImmReg {
+                simm32: 0,
+                base: regs::rsp(),
+                flags: MemFlags::trusted(),
+            }),
+        }
+        .emit(&[], sink, info, state);
+    }
 }

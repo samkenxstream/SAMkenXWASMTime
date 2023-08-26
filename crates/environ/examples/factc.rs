@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::io::Write;
 use std::path::PathBuf;
-use wasmparser::{Payload, Validator, WasmFeatures};
+use wasmparser::{Validator, WasmFeatures};
 use wasmtime_environ::component::*;
 use wasmtime_environ::fact::Module;
 
@@ -55,10 +55,10 @@ struct Factc {
     #[clap(short, long)]
     text: bool,
 
-    #[clap(long, parse(try_from_str = parse_string_encoding), default_value = "utf8")]
+    #[clap(long, value_parser = parse_string_encoding, default_value = "utf8")]
     lift_str: StringEncoding,
 
-    #[clap(long, parse(try_from_str = parse_string_encoding), default_value = "utf8")]
+    #[clap(long, value_parser = parse_string_encoding, default_value = "utf8")]
     lower_str: StringEncoding,
 
     /// TODO
@@ -120,59 +120,54 @@ impl Factc {
 
         let mut adapters = Vec::new();
         let input = wat::parse_file(&self.input)?;
-        types.push_type_scope();
         let mut validator = Validator::new_with_features(WasmFeatures {
             component_model: true,
             ..Default::default()
         });
-        for payload in wasmparser::Parser::new(0).parse_all(&input) {
-            let payload = payload?;
-            validator.payload(&payload)?;
-            let section = match payload {
-                Payload::ComponentTypeSection(s) => s,
+        let wasm_types = validator
+            .validate_all(&input)
+            .context("failed to validate input wasm")?;
+        let wasm_types = wasm_types.as_ref();
+        for i in 0..wasm_types.component_type_count() {
+            let ty = wasm_types.component_type_at(i);
+            let ty = match &wasm_types[ty] {
+                wasmparser::types::Type::ComponentFunc(_) => {
+                    types.convert_component_func_type(wasm_types, ty)?
+                }
                 _ => continue,
             };
-            for ty in section {
-                let ty = types.intern_component_type(&ty?)?;
-                types.push_component_typedef(ty);
-                let ty = match ty {
-                    TypeDef::ComponentFunc(ty) => ty,
-                    _ => continue,
-                };
-                adapters.push(Adapter {
-                    lift_ty: ty,
-                    lower_ty: ty,
-                    lower_options: AdapterOptions {
-                        instance: RuntimeComponentInstanceIndex::from_u32(0),
-                        string_encoding: self.lower_str,
-                        memory64: self.lower64,
-                        // Pessimistically assume that memory/realloc are going to be
-                        // required for this trampoline and provide it. Avoids doing
-                        // calculations to figure out whether they're necessary and
-                        // simplifies the fuzzer here without reducing coverage within FACT
-                        // itself.
-                        memory: Some(dummy_memory(self.lower64)),
-                        realloc: Some(dummy_def()),
-                        // Lowering never allows `post-return`
-                        post_return: None,
+            adapters.push(Adapter {
+                lift_ty: ty,
+                lower_ty: ty,
+                lower_options: AdapterOptions {
+                    instance: RuntimeComponentInstanceIndex::from_u32(0),
+                    string_encoding: self.lower_str,
+                    memory64: self.lower64,
+                    // Pessimistically assume that memory/realloc are going to be
+                    // required for this trampoline and provide it. Avoids doing
+                    // calculations to figure out whether they're necessary and
+                    // simplifies the fuzzer here without reducing coverage within FACT
+                    // itself.
+                    memory: Some(dummy_memory(self.lower64)),
+                    realloc: Some(dummy_def()),
+                    // Lowering never allows `post-return`
+                    post_return: None,
+                },
+                lift_options: AdapterOptions {
+                    instance: RuntimeComponentInstanceIndex::from_u32(1),
+                    string_encoding: self.lift_str,
+                    memory64: self.lift64,
+                    memory: Some(dummy_memory(self.lift64)),
+                    realloc: Some(dummy_def()),
+                    post_return: if self.post_return {
+                        Some(dummy_def())
+                    } else {
+                        None
                     },
-                    lift_options: AdapterOptions {
-                        instance: RuntimeComponentInstanceIndex::from_u32(1),
-                        string_encoding: self.lift_str,
-                        memory64: self.lift64,
-                        memory: Some(dummy_memory(self.lift64)),
-                        realloc: Some(dummy_def()),
-                        post_return: if self.post_return {
-                            Some(dummy_def())
-                        } else {
-                            None
-                        },
-                    },
-                    func: dummy_def(),
-                });
-            }
+                },
+                func: dummy_def(),
+            });
         }
-        types.pop_type_scope();
 
         let mut fact_module = Module::new(&types, self.debug);
         for (i, adapter) in adapters.iter().enumerate() {

@@ -38,19 +38,19 @@ async fn run(name: &str, inherit_stdio: bool) -> Result<()> {
         let mut builder = WasiCtxBuilder::new();
 
         if inherit_stdio {
-            builder = builder.inherit_stdio();
+            builder.inherit_stdio();
         } else {
-            builder = builder
+            builder
                 .stdout(Box::new(stdout.clone()))
                 .stderr(Box::new(stderr.clone()));
         }
-        builder = builder.arg(name)?.arg(".")?;
+        builder.arg(name)?.arg(".")?;
         println!("preopen: {:?}", workspace);
         let preopen_dir =
             cap_std::fs::Dir::open_ambient_dir(workspace.path(), cap_std::ambient_authority())?;
-        builder = builder.preopened_dir(preopen_dir, ".")?;
+        builder.preopened_dir(preopen_dir, ".")?;
         for (var, val) in test_programs::wasi_tests_environment() {
-            builder = builder.env(var, val)?;
+            builder.env(var, val)?;
         }
 
         let mut store = Store::new(&ENGINE, builder.build());
@@ -162,8 +162,8 @@ async fn interesting_paths() {
     run("interesting_paths", true).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
-async fn isatty() {
-    run("isatty", true).await.unwrap()
+async fn regular_file_isatty() {
+    run("regular_file_isatty", false).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn nofollow_errors() {
@@ -188,6 +188,10 @@ async fn path_link() {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn path_open_create_existing() {
     run("path_open_create_existing", true).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn path_open_read_write() {
+    run("path_open_read_write", true).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn path_open_dirfd_not_dir() {
@@ -256,6 +260,19 @@ async fn stdio() {
     run("stdio", true).await.unwrap()
 }
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn stdio_isatty() {
+    // Only a valid test if the host executable's stdio is a terminal:
+    if test_programs::stdio_is_terminal() {
+        // Inherit stdio, test asserts it is a tty:
+        run("stdio_isatty", true).await.unwrap()
+    }
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn stdio_not_isatty() {
+    // Don't inherit stdio, test asserts each is not tty:
+    run("stdio_not_isatty", false).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn symlink_create() {
     run("symlink_create", true).await.unwrap()
 }
@@ -270,4 +287,8 @@ async fn symlink_loop() {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn unlink_file_trailing_slashes() {
     run("unlink_file_trailing_slashes", true).await.unwrap()
+}
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn path_open_preopen() {
+    run("path_open_preopen", true).await.unwrap()
 }

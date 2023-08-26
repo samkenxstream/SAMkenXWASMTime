@@ -49,7 +49,7 @@ pub(crate) fn encode_sib(shift: u8, enc_index: u8, enc_base: u8) -> u8 {
 #[inline(always)]
 pub(crate) fn int_reg_enc(reg: impl Into<Reg>) -> u8 {
     let reg = reg.into();
-    debug_assert!(reg.is_real());
+    debug_assert!(reg.is_real(), "reg = {reg:?}");
     debug_assert_eq!(reg.class(), RegClass::Int);
     reg.to_real_reg().unwrap().hw_enc()
 }
@@ -344,7 +344,7 @@ pub(crate) fn emit_std_enc_mem(
     }
 
     // And finally encode the mod/rm bytes and all further information.
-    emit_modrm_sib_disp(sink, enc_g, mem_e, bytes_at_end)
+    emit_modrm_sib_disp(sink, enc_g, mem_e, bytes_at_end, None)
 }
 
 pub(crate) fn emit_modrm_sib_disp(
@@ -352,11 +352,12 @@ pub(crate) fn emit_modrm_sib_disp(
     enc_g: u8,
     mem_e: &Amode,
     bytes_at_end: u8,
+    evex_scaling: Option<i8>,
 ) {
     match *mem_e {
         Amode::ImmReg { simm32, base, .. } => {
             let enc_e = int_reg_enc(base);
-            let mut imm = Imm::new(simm32);
+            let mut imm = Imm::new(simm32, evex_scaling);
 
             // Most base registers allow for a single ModRM byte plus an
             // optional immediate. If rsp is the base register, however, then a
@@ -403,7 +404,7 @@ pub(crate) fn emit_modrm_sib_disp(
             // that if the base register's lower three bits are `101` then an
             // offset must be present. This is a special case in the encoding of
             // the SIB byte and requires an explicit displacement with rbp/r13.
-            let mut imm = Imm::new(simm32);
+            let mut imm = Imm::new(simm32, evex_scaling);
             if enc_base & 7 == regs::ENC_RBP {
                 imm.force_immediate();
             }
@@ -428,27 +429,50 @@ pub(crate) fn emit_modrm_sib_disp(
             // to the end of the u32 field. So, to compensate for
             // this, we emit a negative extra offset in the u32 field
             // initially, and the relocation will add to it.
-            sink.put4(-(bytes_at_end as i32) as u32);
+            sink.put4(-(i32::from(bytes_at_end)) as u32);
         }
     }
 }
 
+#[derive(Copy, Clone)]
 enum Imm {
     None,
-    Imm8(u8),
-    Imm32(u32),
+    Imm8(i8),
+    Imm32(i32),
 }
 
 impl Imm {
     /// Classifies the 32-bit immediate `val` as how this can be encoded
     /// with ModRM/SIB bytes.
-    fn new(val: u32) -> Imm {
+    ///
+    /// For `evex_scaling` according to Section 2.7.5 of Intel's manual:
+    ///
+    /// > EVEX-encoded instructions always use a compressed displacement scheme
+    /// > by multiplying disp8 in conjunction with a scaling factor N that is
+    /// > determined based on the vector length, the value of EVEX.b bit
+    /// > (embedded broadcast) and the input element size of the instruction
+    ///
+    /// The `evex_scaling` factor provided here is `Some(N)` for EVEX
+    /// instructions.  This is taken into account where the `Imm` value
+    /// contained is the raw byte offset.
+    fn new(val: i32, evex_scaling: Option<i8>) -> Imm {
         if val == 0 {
-            Imm::None
-        } else if low8_will_sign_extend_to_32(val) {
-            Imm::Imm8(val as u8)
-        } else {
-            Imm::Imm32(val)
+            return Imm::None;
+        }
+        match evex_scaling {
+            Some(scaling) => {
+                if val % i32::from(scaling) == 0 {
+                    let scaled = val / i32::from(scaling);
+                    if low8_will_sign_extend_to_32(scaled as u32) {
+                        return Imm::Imm8(scaled as i8);
+                    }
+                }
+                Imm::Imm32(val)
+            }
+            None => match i8::try_from(val) {
+                Ok(val) => Imm::Imm8(val),
+                Err(_) => Imm::Imm32(val),
+            },
         }
     }
 
@@ -473,8 +497,8 @@ impl Imm {
     fn emit(&self, sink: &mut MachBuffer<Inst>) {
         match self {
             Imm::None => {}
-            Imm::Imm8(n) => sink.put1(*n),
-            Imm::Imm32(n) => sink.put4(*n),
+            Imm::Imm8(n) => sink.put1(*n as u8),
+            Imm::Imm32(n) => sink.put4(*n as u32),
         }
     }
 }

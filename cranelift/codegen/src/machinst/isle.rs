@@ -306,11 +306,12 @@ macro_rules! isle_lower_prelude_methods {
         #[inline]
         fn func_ref_data(&mut self, func_ref: FuncRef) -> (SigRef, ExternalName, RelocDistance) {
             let funcdata = &self.lower_ctx.dfg().ext_funcs[func_ref];
-            (
-                funcdata.signature,
-                funcdata.name.clone(),
-                funcdata.reloc_distance(),
-            )
+            let reloc_distance = if funcdata.colocated {
+                RelocDistance::Near
+            } else {
+                RelocDistance::Far
+            };
+            (funcdata.signature, funcdata.name.clone(), reloc_distance)
         }
 
         #[inline]
@@ -340,6 +341,13 @@ macro_rules! isle_lower_prelude_methods {
         fn u128_from_immediate(&mut self, imm: Immediate) -> Option<u128> {
             let bytes = self.lower_ctx.get_immediate_data(imm).as_slice();
             Some(u128::from_le_bytes(bytes.try_into().ok()?))
+        }
+
+        #[inline]
+        fn vconst_from_immediate(&mut self, imm: Immediate) -> Option<VCodeConstant> {
+            Some(self.lower_ctx.use_constant(VCodeConstantData::Generated(
+                self.lower_ctx.get_immediate_data(imm).clone(),
+            )))
         }
 
         #[inline]
@@ -682,8 +690,7 @@ macro_rules! isle_prelude_caller_methods {
                 dist,
                 caller_conv,
                 self.backend.flags().clone(),
-            )
-            .unwrap();
+            );
 
             assert_eq!(
                 inputs.len(&self.lower_ctx.dfg().value_lists) - off,
@@ -711,8 +718,7 @@ macro_rules! isle_prelude_caller_methods {
                 Opcode::CallIndirect,
                 caller_conv,
                 self.backend.flags().clone(),
-            )
-            .unwrap();
+            );
 
             assert_eq!(
                 inputs.len(&self.lower_ctx.dfg().value_lists) - off,
@@ -730,16 +736,8 @@ macro_rules! isle_prelude_caller_methods {
 #[doc(hidden)]
 macro_rules! isle_prelude_method_helpers {
     ($abicaller:ty) => {
-        fn gen_call_common(
-            &mut self,
-            abi: Sig,
-            num_rets: usize,
-            mut caller: $abicaller,
-            (inputs, off): ValueSlice,
-        ) -> InstOutput {
-            caller.emit_stack_pre_adjust(self.lower_ctx);
-
-            let num_args = self.lower_ctx.sigs().num_args(abi);
+        fn gen_call_common_args(&mut self, call_site: &mut $abicaller, (inputs, off): ValueSlice) {
+            let num_args = call_site.num_args(self.lower_ctx.sigs());
 
             assert_eq!(
                 inputs.len(&self.lower_ctx.dfg().value_lists) - off,
@@ -753,13 +751,25 @@ macro_rules! isle_prelude_method_helpers {
                 arg_regs.push(self.put_in_regs(input));
             }
             for (i, arg_regs) in arg_regs.iter().enumerate() {
-                caller.emit_copy_regs_to_buffer(self.lower_ctx, i, *arg_regs);
+                call_site.emit_copy_regs_to_buffer(self.lower_ctx, i, *arg_regs);
             }
             for (i, arg_regs) in arg_regs.iter().enumerate() {
-                for inst in caller.gen_arg(self.lower_ctx, i, *arg_regs) {
+                for inst in call_site.gen_arg(self.lower_ctx, i, *arg_regs) {
                     self.lower_ctx.emit(inst);
                 }
             }
+        }
+
+        fn gen_call_common(
+            &mut self,
+            abi: Sig,
+            num_rets: usize,
+            mut caller: $abicaller,
+            args: ValueSlice,
+        ) -> InstOutput {
+            caller.emit_stack_pre_adjust(self.lower_ctx);
+
+            self.gen_call_common_args(&mut caller, args);
 
             // Handle retvals prior to emitting call, so the
             // constraints are on the call instruction; but buffer the

@@ -34,6 +34,7 @@
 use crate::RunResult;
 use std::cell::Cell;
 use std::io;
+use std::ops::Range;
 use std::ptr;
 
 #[derive(Debug)]
@@ -41,8 +42,10 @@ pub struct FiberStack {
     // The top of the stack; for stacks allocated by the fiber implementation itself,
     // the base address of the allocation will be `top.sub(len.unwrap())`
     top: *mut u8,
-    // The length of the stack; `None` when the stack was not created by this implementation.
-    len: Option<usize>,
+    // The length of the stack
+    len: usize,
+    // whether or not this stack was mmap'd
+    mmap: bool,
 }
 
 impl FiberStack {
@@ -74,25 +77,35 @@ impl FiberStack {
 
             Ok(Self {
                 top: mmap.cast::<u8>().add(mmap_len),
-                len: Some(mmap_len),
+                len: mmap_len,
+                mmap: true,
             })
         }
     }
 
-    pub unsafe fn from_top_ptr(top: *mut u8) -> io::Result<Self> {
-        Ok(Self { top, len: None })
+    pub unsafe fn from_raw_parts(base: *mut u8, len: usize) -> io::Result<Self> {
+        Ok(Self {
+            top: base.add(len),
+            len,
+            mmap: false,
+        })
     }
 
     pub fn top(&self) -> Option<*mut u8> {
         Some(self.top)
+    }
+
+    pub fn range(&self) -> Option<Range<usize>> {
+        let base = unsafe { self.top.sub(self.len) as usize };
+        Some(base..base + self.len)
     }
 }
 
 impl Drop for FiberStack {
     fn drop(&mut self) {
         unsafe {
-            if let Some(len) = self.len {
-                let ret = rustix::mm::munmap(self.top.sub(len) as _, len);
+            if self.mmap {
+                let ret = rustix::mm::munmap(self.top.sub(self.len) as _, self.len);
                 debug_assert!(ret.is_ok());
             }
         }
@@ -104,13 +117,16 @@ pub struct Fiber;
 pub struct Suspend(*mut u8);
 
 extern "C" {
+    #[wasmtime_versioned_export_macros::versioned_link]
     fn wasmtime_fiber_init(
         top_of_stack: *mut u8,
         entry: extern "C" fn(*mut u8, *mut u8),
         entry_arg0: *mut u8,
     );
+    #[wasmtime_versioned_export_macros::versioned_link]
     fn wasmtime_fiber_switch(top_of_stack: *mut u8);
     #[allow(dead_code)] // only used in inline assembly for some platforms
+    #[wasmtime_versioned_export_macros::versioned_link]
     fn wasmtime_fiber_start();
 }
 

@@ -9,12 +9,16 @@
         .type host_to_wasm_trampoline,@function
         .p2align 2
 
+#define CONCAT2(a, b) a ## b
+#define CONCAT(a, b) CONCAT2(a , b)
+#define VERSIONED_SYMBOL(a) CONCAT(a, VERSIONED_SUFFIX)
+
 #define LIBCALL_TRAMPOLINE(libcall, libcall_impl)                                 \
-        .hidden libcall ;                                                         \
-        .globl libcall ;                                                          \
-        .type libcall,@function ;                                                 \
+        .hidden VERSIONED_SYMBOL(libcall) ;                                       \
+        .globl VERSIONED_SYMBOL(libcall) ;                                        \
+        .type VERSIONED_SYMBOL(libcall),@function ;                               \
         .p2align 2 ;                                                              \
-libcall: ;                                                                        \
+VERSIONED_SYMBOL(libcall): ;                                                      \
         .cfi_startproc ;                                                          \
                                                                                   \
         /* Load the pointer to `VMRuntimeLimits` in `%r1`.  */                    \
@@ -28,10 +32,10 @@ libcall: ;                                                                      
         stg %r14, 32(%r1) ;                                                       \
                                                                                   \
         /* Tail call to the actual implementation of this libcall.  */            \
-        jg libcall_impl ;                                                         \
+        jg VERSIONED_SYMBOL(libcall_impl) ;                                       \
                                                                                   \
         .cfi_endproc ;                                                            \
-        .size libcall,.-libcall
+        .size VERSIONED_SYMBOL(libcall),.-VERSIONED_SYMBOL(libcall)
 
 LIBCALL_TRAMPOLINE(memory32_grow, impl_memory32_grow)
 LIBCALL_TRAMPOLINE(table_grow_func_ref, impl_table_grow_func_ref)
@@ -56,3 +60,11 @@ LIBCALL_TRAMPOLINE(memory_atomic_wait32, impl_memory_atomic_wait32)
 LIBCALL_TRAMPOLINE(memory_atomic_wait64, impl_memory_atomic_wait64)
 LIBCALL_TRAMPOLINE(out_of_gas, impl_out_of_gas)
 LIBCALL_TRAMPOLINE(new_epoch, impl_new_epoch)
+LIBCALL_TRAMPOLINE(check_malloc, impl_check_malloc)
+LIBCALL_TRAMPOLINE(check_free, impl_check_free)
+LIBCALL_TRAMPOLINE(check_load, impl_check_load)
+LIBCALL_TRAMPOLINE(check_store, impl_check_store)
+LIBCALL_TRAMPOLINE(malloc_start, impl_malloc_start)
+LIBCALL_TRAMPOLINE(free_start, impl_free_start)
+LIBCALL_TRAMPOLINE(update_stack_pointer, impl_update_stack_pointer)
+LIBCALL_TRAMPOLINE(update_mem_size, impl_update_mem_size)

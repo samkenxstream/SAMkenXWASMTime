@@ -2,41 +2,41 @@
 
 use crate::{
     isa::reg::Reg,
-    masm::{CalleeKind, DivKind, OperandSize, RemKind},
+    masm::{CalleeKind, CmpKind, DivKind, OperandSize, RemKind, ShiftKind},
 };
 use cranelift_codegen::{
     entity::EntityRef,
-    ir::TrapCode,
-    ir::{ExternalName, Opcode, UserExternalNameRef},
-    isa::x64::{
-        args::{
-            self, AluRmiROpcode, Amode, CmpOpcode, DivSignedness, ExtMode, FromWritableReg, Gpr,
-            GprMem, GprMemImm, RegMem, RegMemImm, SyntheticAmode, WritableGpr, CC,
+    ir::{types, ConstantPool, ExternalName, Opcode, TrapCode, UserExternalNameRef},
+    isa::{
+        x64::{
+            args::{
+                self, AluRmiROpcode, Amode, CmpOpcode, DivSignedness, ExtMode, FromWritableReg,
+                Gpr, GprMem, GprMemImm, Imm8Gpr, Imm8Reg, RegMem, RegMemImm,
+                ShiftKind as CraneliftShiftKind, SseOpcode, SyntheticAmode, WritableGpr,
+                WritableXmm, Xmm, XmmMem, XmmMemAligned, CC,
+            },
+            settings as x64_settings, CallInfo, EmitInfo, EmitState, Inst,
         },
-        settings as x64_settings, CallInfo, EmitInfo, EmitState, Inst,
+        CallConv,
     },
-    settings, Final, MachBuffer, MachBufferFinalized, MachInstEmit, MachInstEmitState, Writable,
+    settings, Final, MachBuffer, MachBufferFinalized, MachInstEmit, MachInstEmitState, MachLabel,
+    VCodeConstantData, VCodeConstants, Writable,
 };
 
-use super::{address::Address, regs};
+use super::address::Address;
 use smallvec::smallvec;
-
-/// A x64 instruction operand.
-#[derive(Debug, Copy, Clone)]
-pub(crate) enum Operand {
-    /// Register.
-    Reg(Reg),
-    /// Memory address.
-    Mem(Address),
-    /// Signed 64-bit immediate.
-    Imm(i64),
-}
 
 // Conversions between winch-codegen x64 types and cranelift-codegen x64 types.
 
 impl From<Reg> for RegMemImm {
     fn from(reg: Reg) -> Self {
         RegMemImm::reg(reg.into())
+    }
+}
+
+impl From<Reg> for RegMem {
+    fn from(value: Reg) -> Self {
+        RegMem::Reg { reg: value.into() }
     }
 }
 
@@ -47,9 +47,22 @@ impl From<Reg> for WritableGpr {
     }
 }
 
+impl From<Reg> for WritableXmm {
+    fn from(reg: Reg) -> Self {
+        let writable = Writable::from_reg(reg.into());
+        WritableXmm::from_writable_reg(writable).expect("valid writable xmm")
+    }
+}
+
 impl From<Reg> for Gpr {
     fn from(reg: Reg) -> Self {
         Gpr::new(reg.into()).expect("valid gpr")
+    }
+}
+
+impl From<Reg> for GprMem {
+    fn from(value: Reg) -> Self {
+        GprMem::new(value.into()).expect("valid gpr")
     }
 }
 
@@ -59,11 +72,24 @@ impl From<Reg> for GprMemImm {
     }
 }
 
+impl From<Reg> for Imm8Gpr {
+    fn from(value: Reg) -> Self {
+        Imm8Gpr::new(Imm8Reg::Reg { reg: value.into() }).expect("valid Imm8Gpr")
+    }
+}
+
+impl From<Reg> for Xmm {
+    fn from(reg: Reg) -> Self {
+        Xmm::new(reg.into()).expect("valid Xmm register")
+    }
+}
+
 impl From<OperandSize> for args::OperandSize {
     fn from(size: OperandSize) -> Self {
         match size {
             OperandSize::S32 => Self::Size32,
             OperandSize::S64 => Self::Size64,
+            s => panic!("Invalid operand size {:?}", s),
         }
     }
 }
@@ -77,6 +103,35 @@ impl From<DivKind> for DivSignedness {
     }
 }
 
+impl From<CmpKind> for CC {
+    fn from(value: CmpKind) -> Self {
+        match value {
+            CmpKind::Eq => CC::Z,
+            CmpKind::Ne => CC::NZ,
+            CmpKind::LtS => CC::L,
+            CmpKind::LtU => CC::B,
+            CmpKind::GtS => CC::NLE,
+            CmpKind::GtU => CC::NBE,
+            CmpKind::LeS => CC::LE,
+            CmpKind::LeU => CC::BE,
+            CmpKind::GeS => CC::NL,
+            CmpKind::GeU => CC::NB,
+        }
+    }
+}
+
+impl From<ShiftKind> for CraneliftShiftKind {
+    fn from(value: ShiftKind) -> Self {
+        match value {
+            ShiftKind::Shl => CraneliftShiftKind::ShiftLeft,
+            ShiftKind::ShrS => CraneliftShiftKind::ShiftRightArithmetic,
+            ShiftKind::ShrU => CraneliftShiftKind::ShiftRightLogical,
+            ShiftKind::Rotl => CraneliftShiftKind::RotateLeft,
+            ShiftKind::Rotr => CraneliftShiftKind::RotateRight,
+        }
+    }
+}
+
 /// Low level assembler implementation for x64.
 pub(crate) struct Assembler {
     /// The machine instruction buffer.
@@ -85,6 +140,12 @@ pub(crate) struct Assembler {
     emit_info: EmitInfo,
     /// Emission state.
     emit_state: EmitState,
+    /// x64 flags.
+    isa_flags: x64_settings::Flags,
+    /// Constant pool.
+    pool: ConstantPool,
+    /// Constants that will be emitted separately by the MachBuffer.
+    constants: VCodeConstants,
 }
 
 impl Assembler {
@@ -93,21 +154,59 @@ impl Assembler {
         Self {
             buffer: MachBuffer::<Inst>::new(),
             emit_state: Default::default(),
-            emit_info: EmitInfo::new(shared_flags, isa_flags),
+            emit_info: EmitInfo::new(shared_flags, isa_flags.clone()),
+            constants: Default::default(),
+            pool: ConstantPool::new(),
+            isa_flags,
         }
+    }
+
+    /// Get a mutable reference to underlying
+    /// machine buffer.
+    pub fn buffer_mut(&mut self) -> &mut MachBuffer<Inst> {
+        &mut self.buffer
+    }
+
+    /// Adds a constant to the constant pool and returns its address.
+    pub fn add_constant(&mut self, constant: &[u8]) -> Address {
+        let handle = self.pool.insert(constant.into());
+        Address::constant(handle)
     }
 
     /// Return the emitted code.
     pub fn finalize(mut self) -> MachBufferFinalized<Final> {
-        let constants = Default::default();
         let stencil = self
             .buffer
-            .finish(&constants, self.emit_state.ctrl_plane_mut());
+            .finish(&self.constants, self.emit_state.ctrl_plane_mut());
         stencil.apply_base_srcloc(Default::default())
     }
 
     fn emit(&mut self, inst: Inst) {
         inst.emit(&[], &mut self.buffer, &self.emit_info, &mut self.emit_state);
+    }
+
+    fn to_synthetic_amode(
+        addr: &Address,
+        pool: &mut ConstantPool,
+        constants: &mut VCodeConstants,
+        buffer: &mut MachBuffer<Inst>,
+    ) -> SyntheticAmode {
+        match addr {
+            Address::Offset { base, offset } => {
+                SyntheticAmode::real(Amode::imm_reg(*offset as i32, (*base).into()))
+            }
+            Address::Const(c) => {
+                // Defer the creation of the
+                // `SyntheticAmode::ConstantOffset` addressing mode
+                // until the address is referenced by an actual
+                // instrunction.
+                let constant_data = pool.get(*c);
+                let data = VCodeConstantData::Pool(*c, constant_data.clone());
+                let constant = constants.insert(VCodeConstantData::Pool(*c, constant_data.clone()));
+                buffer.register_constant(&constant, &data);
+                SyntheticAmode::ConstantOffset(constant)
+            }
+        }
     }
 
     /// Push register.
@@ -124,33 +223,10 @@ impl Assembler {
 
     /// Return instruction.
     pub fn ret(&mut self) {
-        self.emit(Inst::Ret { rets: vec![] });
-    }
-
-    /// Move instruction variants.
-    pub fn mov(&mut self, src: Operand, dst: Operand, size: OperandSize) {
-        use self::Operand::*;
-
-        match &(src, dst) {
-            (Reg(lhs), Reg(rhs)) => self.mov_rr(*lhs, *rhs, size),
-            (Reg(lhs), Mem(addr)) => match addr {
-                Address::Offset { base, offset: imm } => self.mov_rm(*lhs, *base, *imm, size),
-            },
-            (Imm(imm), Mem(addr)) => match addr {
-                Address::Offset { base, offset: disp } => {
-                    self.mov_im(*imm as u64, *base, *disp, size)
-                }
-            },
-            (Imm(imm), Reg(reg)) => self.mov_ir(*imm as u64, *reg, size),
-            (Mem(addr), Reg(reg)) => match addr {
-                Address::Offset { base, offset: imm } => self.mov_mr(*base, *imm, *reg, size),
-            },
-
-            _ => panic!(
-                "Invalid operand combination for mov; src={:?}, dst={:?}",
-                src, dst
-            ),
-        }
+        self.emit(Inst::Ret {
+            rets: vec![],
+            stack_bytes_to_pop: 0,
+        });
     }
 
     /// Register-to-register move.
@@ -163,23 +239,26 @@ impl Assembler {
     }
 
     /// Register-to-memory move.
-    pub fn mov_rm(&mut self, src: Reg, base: Reg, disp: u32, size: OperandSize) {
-        let dst = Amode::imm_reg(disp, base.into());
-
+    pub fn mov_rm(&mut self, src: Reg, addr: &Address, size: OperandSize) {
+        assert!(addr.is_offset());
+        let dst =
+            Self::to_synthetic_amode(addr, &mut self.pool, &mut self.constants, &mut self.buffer);
         self.emit(Inst::MovRM {
             size: size.into(),
             src: src.into(),
-            dst: SyntheticAmode::real(dst),
+            dst,
         });
     }
 
     /// Immediate-to-memory move.
-    pub fn mov_im(&mut self, src: u64, base: Reg, disp: u32, size: OperandSize) {
-        let dst = Amode::imm_reg(disp, base.into());
+    pub fn mov_im(&mut self, src: u64, addr: &Address, size: OperandSize) {
+        assert!(addr.is_offset());
+        let dst =
+            Self::to_synthetic_amode(addr, &mut self.pool, &mut self.constants, &mut self.buffer);
         self.emit(Inst::MovImmM {
             size: size.into(),
             simm64: src,
-            dst: SyntheticAmode::real(dst),
+            dst,
         });
     }
 
@@ -196,11 +275,11 @@ impl Assembler {
     }
 
     /// Memory-to-register load.
-    pub fn mov_mr(&mut self, base: Reg, disp: u32, dst: Reg, size: OperandSize) {
+    pub fn mov_mr(&mut self, addr: &Address, dst: Reg, size: OperandSize) {
         use OperandSize::S64;
 
-        let amode = Amode::imm_reg(disp, base.into());
-        let src = SyntheticAmode::real(amode);
+        let src =
+            Self::to_synthetic_amode(addr, &mut self.pool, &mut self.constants, &mut self.buffer);
 
         if size == S64 {
             self.emit(Inst::Mov64MR {
@@ -217,24 +296,92 @@ impl Assembler {
         }
     }
 
-    /// Subtract instruction variants.
-    pub fn sub(&mut self, src: Operand, dst: Operand, size: OperandSize) {
-        match &(src, dst) {
-            (Operand::Imm(imm), Operand::Reg(dst)) => {
-                if let Ok(val) = i32::try_from(*imm) {
-                    self.sub_ir(val, *dst, size)
-                } else {
-                    let scratch = regs::scratch();
-                    self.mov_ir(*imm as u64, scratch, size);
-                    self.sub_rr(scratch, *dst, size);
-                }
-            }
-            (Operand::Reg(src), Operand::Reg(dst)) => self.sub_rr(*src, *dst, size),
-            _ => panic!(
-                "Invalid operand combination for sub; src = {:?} dst = {:?}",
-                src, dst
-            ),
-        }
+    /// Integer register conditional move.
+    pub fn cmov(&mut self, src: Reg, dst: Reg, cc: CmpKind, size: OperandSize) {
+        self.emit(Inst::Cmove {
+            size: size.into(),
+            cc: cc.into(),
+            consequent: src.into(),
+            alternative: dst.into(),
+            dst: dst.into(),
+        })
+    }
+
+    /// Single and double precision floating point
+    /// register-to-register move.
+    pub fn xmm_mov_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        use OperandSize::*;
+
+        let op = match size {
+            S32 => SseOpcode::Movaps,
+            S64 => SseOpcode::Movapd,
+            S128 => SseOpcode::Movdqa,
+        };
+
+        self.emit(Inst::XmmUnaryRmRUnaligned {
+            op,
+            src: XmmMem::new(src.into()).expect("valid xmm unaligned"),
+            dst: dst.into(),
+        });
+    }
+
+    /// Single and double precision floating point load.
+    pub fn xmm_mov_mr(&mut self, src: &Address, dst: Reg, size: OperandSize) {
+        use OperandSize::*;
+
+        assert!(dst.is_float());
+        let op = match size {
+            S32 => SseOpcode::Movss,
+            S64 => SseOpcode::Movsd,
+            S128 => SseOpcode::Movdqu,
+        };
+
+        let src =
+            Self::to_synthetic_amode(src, &mut self.pool, &mut self.constants, &mut self.buffer);
+        self.emit(Inst::XmmUnaryRmRUnaligned {
+            op,
+            src: XmmMem::new(RegMem::mem(src)).expect("valid xmm unaligned"),
+            dst: dst.into(),
+        });
+    }
+
+    /// Single and double precision floating point store.
+    pub fn xmm_mov_rm(&mut self, src: Reg, dst: &Address, size: OperandSize) {
+        use OperandSize::*;
+
+        assert!(src.is_float());
+
+        let op = match size {
+            S32 => SseOpcode::Movss,
+            S64 => SseOpcode::Movsd,
+            S128 => SseOpcode::Movdqu,
+        };
+
+        let dst =
+            Self::to_synthetic_amode(dst, &mut self.pool, &mut self.constants, &mut self.buffer);
+        self.emit(Inst::XmmMovRM {
+            op,
+            src: src.into(),
+            dst,
+        });
+    }
+
+    /// Floating point register conditional move.
+    pub fn xmm_cmov(&mut self, src: Reg, dst: Reg, cc: CmpKind, size: OperandSize) {
+        let ty = match size {
+            OperandSize::S32 => types::F32,
+            OperandSize::S64 => types::F64,
+            // Move the entire 128 bits via movdqa.
+            OperandSize::S128 => types::I128,
+        };
+
+        self.emit(Inst::XmmCmove {
+            ty,
+            cc: cc.into(),
+            consequent: XmmMemAligned::new(src.into()).expect("valid XmmMemAligned"),
+            alternative: dst.into(),
+            dst: dst.into(),
+        })
     }
 
     /// Subtract register and register
@@ -261,24 +408,96 @@ impl Assembler {
         });
     }
 
-    /// Signed multiplication instruction.
-    pub fn mul(&mut self, src: Operand, dst: Operand, size: OperandSize) {
-        match &(src, dst) {
-            (Operand::Imm(imm), Operand::Reg(dst)) => {
-                if let Ok(val) = i32::try_from(*imm) {
-                    self.mul_ir(val, *dst, size);
-                } else {
-                    let scratch = regs::scratch();
-                    self.mov_ir(*imm as u64, scratch, size);
-                    self.mul_rr(scratch, *dst, size);
-                }
-            }
-            (Operand::Reg(src), Operand::Reg(dst)) => self.mul_rr(*src, *dst, size),
-            _ => panic!(
-                "Invalid operand combination for mul; src = {:?} dst = {:?}",
-                src, dst
-            ),
-        }
+    /// "and" two registers.
+    pub fn and_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::AluRmiR {
+            size: size.into(),
+            op: AluRmiROpcode::And,
+            src1: dst.into(),
+            src2: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    pub fn and_ir(&mut self, imm: i32, dst: Reg, size: OperandSize) {
+        let imm = RegMemImm::imm(imm as u32);
+
+        self.emit(Inst::AluRmiR {
+            size: size.into(),
+            op: AluRmiROpcode::And,
+            src1: dst.into(),
+            src2: GprMemImm::new(imm).expect("valid immediate"),
+            dst: dst.into(),
+        });
+    }
+
+    pub fn or_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::AluRmiR {
+            size: size.into(),
+            op: AluRmiROpcode::Or,
+            src1: dst.into(),
+            src2: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    pub fn or_ir(&mut self, imm: i32, dst: Reg, size: OperandSize) {
+        let imm = RegMemImm::imm(imm as u32);
+
+        self.emit(Inst::AluRmiR {
+            size: size.into(),
+            op: AluRmiROpcode::Or,
+            src1: dst.into(),
+            src2: GprMemImm::new(imm).expect("valid immediate"),
+            dst: dst.into(),
+        });
+    }
+
+    /// Logical exclusive or with registers.
+    pub fn xor_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::AluRmiR {
+            size: size.into(),
+            op: AluRmiROpcode::Xor,
+            src1: dst.into(),
+            src2: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    pub fn xor_ir(&mut self, imm: i32, dst: Reg, size: OperandSize) {
+        let imm = RegMemImm::imm(imm as u32);
+
+        self.emit(Inst::AluRmiR {
+            size: size.into(),
+            op: AluRmiROpcode::Xor,
+            src1: dst.into(),
+            src2: GprMemImm::new(imm).expect("valid immediate"),
+            dst: dst.into(),
+        });
+    }
+
+    /// Shift with register and register.
+    pub fn shift_rr(&mut self, src: Reg, dst: Reg, kind: ShiftKind, size: OperandSize) {
+        self.emit(Inst::ShiftR {
+            size: size.into(),
+            kind: kind.into(),
+            src: dst.into(),
+            num_bits: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    /// Shift with immediate and register.
+    pub fn shift_ir(&mut self, imm: u8, dst: Reg, kind: ShiftKind, size: OperandSize) {
+        let imm = imm.into();
+
+        self.emit(Inst::ShiftR {
+            size: size.into(),
+            kind: kind.into(),
+            src: dst.into(),
+            num_bits: Imm8Gpr::new(imm).expect("valid immediate"),
+            dst: dst.into(),
+        });
     }
 
     /// Signed/unsigned division.
@@ -417,26 +636,6 @@ impl Assembler {
         });
     }
 
-    /// Add instruction variants.
-    pub fn add(&mut self, src: Operand, dst: Operand, size: OperandSize) {
-        match &(src, dst) {
-            (Operand::Imm(imm), Operand::Reg(dst)) => {
-                if let Ok(val) = i32::try_from(*imm) {
-                    self.add_ir(val, *dst, size)
-                } else {
-                    let scratch = regs::scratch();
-                    self.mov_ir(*imm as u64, scratch, size);
-                    self.add_rr(scratch, *dst, size);
-                }
-            }
-            (Operand::Reg(src), Operand::Reg(dst)) => self.add_rr(*src, *dst, size),
-            _ => panic!(
-                "Invalid operand combination for add; src = {:?} dst = {:?}",
-                src, dst
-            ),
-        }
-    }
-
     /// Add immediate and register.
     pub fn add_ir(&mut self, imm: i32, dst: Reg, size: OperandSize) {
         let imm = RegMemImm::imm(imm as u32);
@@ -461,17 +660,123 @@ impl Assembler {
         });
     }
 
-    /// Logical exclusive or with registers.
-    pub fn xor_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
-        self.emit(Inst::AluRmiR {
+    pub fn cmp_ir(&mut self, imm: i32, dst: Reg, size: OperandSize) {
+        let imm = RegMemImm::imm(imm as u32);
+
+        self.emit(Inst::CmpRmiR {
             size: size.into(),
-            op: AluRmiROpcode::Xor,
-            src1: dst.into(),
-            src2: src.into(),
+            opcode: CmpOpcode::Cmp,
+            src: GprMemImm::new(imm).expect("valid immediate"),
             dst: dst.into(),
         });
     }
 
+    pub fn cmp_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::CmpRmiR {
+            size: size.into(),
+            opcode: CmpOpcode::Cmp,
+            src: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    pub fn popcnt(&mut self, src: Reg, size: OperandSize) {
+        assert!(self.isa_flags.has_popcnt(), "Requires has_popcnt flag");
+        self.emit(Inst::UnaryRmR {
+            size: size.into(),
+            op: args::UnaryRmROpcode::Popcnt,
+            src: src.into(),
+            dst: src.into(),
+        });
+    }
+
+    /// Emit a test instruction with two register operands.
+    pub fn test_rr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::CmpRmiR {
+            size: size.into(),
+            opcode: CmpOpcode::Test,
+            src: src.into(),
+            dst: dst.into(),
+        })
+    }
+
+    /// Set value in dst to `0` or `1` based on flags in status register and
+    /// [`CmpKind`].
+    pub fn setcc(&mut self, kind: CmpKind, dst: Reg) {
+        // Clear the dst register or bits 1 to 31 may be incorrectly set.
+        // Don't use xor since it updates the status register.
+        self.emit(Inst::Imm {
+            dst_size: args::OperandSize::Size32, // Always going to be an i32 result.
+            simm64: 0,
+            dst: dst.into(),
+        });
+        // Copy correct bit from status register into dst register.
+        self.emit(Inst::Setcc {
+            cc: kind.into(),
+            dst: dst.into(),
+        });
+    }
+
+    /// Store the count of leading zeroes in src in dst.
+    /// Requires `has_lzcnt` flag.
+    pub fn lzcnt(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        assert!(self.isa_flags.has_lzcnt(), "Requires has_lzcnt flag");
+        self.emit(Inst::UnaryRmR {
+            size: size.into(),
+            op: args::UnaryRmROpcode::Lzcnt,
+            src: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    /// Store the count of trailing zeroes in src in dst.
+    /// Requires `has_bmi1` flag.
+    pub fn tzcnt(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        assert!(self.isa_flags.has_bmi1(), "Requires has_bmi1 flag");
+        self.emit(Inst::UnaryRmR {
+            size: size.into(),
+            op: args::UnaryRmROpcode::Tzcnt,
+            src: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    /// Stores position of the most significant bit set in src in dst.
+    /// Zero flag is set if src is equal to 0.
+    pub fn bsr(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::UnaryRmR {
+            size: size.into(),
+            op: args::UnaryRmROpcode::Bsr,
+            src: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    /// Performs integer negation on src and places result in dst.
+    pub fn neg(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::Neg {
+            size: size.into(),
+            src: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    /// Stores position of the least significant bit set in src in dst.
+    /// Zero flag is set if src is equal to 0.
+    pub fn bsf(&mut self, src: Reg, dst: Reg, size: OperandSize) {
+        self.emit(Inst::UnaryRmR {
+            size: size.into(),
+            op: args::UnaryRmROpcode::Bsf,
+            src: src.into(),
+            dst: dst.into(),
+        });
+    }
+
+    /// Emit a function call to a known or unknown location.
+    ///
+    /// A known location is a locally defined function index.
+    /// An unknown location is an address whose value is located
+    /// ina register.
     pub fn call(&mut self, callee: CalleeKind) {
         match callee {
             CalleeKind::Indirect(reg) => {
@@ -482,6 +787,8 @@ impl Assembler {
                         defs: smallvec![],
                         clobbers: Default::default(),
                         opcode: Opcode::Call,
+                        callee_pop_size: 0,
+                        callee_conv: CallConv::SystemV,
                     }),
                 });
             }
@@ -494,9 +801,29 @@ impl Assembler {
                         defs: smallvec![],
                         clobbers: Default::default(),
                         opcode: Opcode::Call,
+                        callee_pop_size: 0,
+                        callee_conv: CallConv::SystemV,
                     }),
                 });
             }
         }
+    }
+
+    /// Emits a conditional jump to the given label.
+    pub fn jmp_if(&mut self, cc: impl Into<CC>, taken: MachLabel) {
+        self.emit(Inst::JmpIf {
+            cc: cc.into(),
+            taken,
+        });
+    }
+
+    /// Performs an unconditional jump to the given label.
+    pub fn jmp(&mut self, target: MachLabel) {
+        self.emit(Inst::JmpKnown { dst: target });
+    }
+
+    /// Emit a trap instruction.
+    pub fn trap(&mut self, code: TrapCode) {
+        self.emit(Inst::Ud2 { trap_code: code })
     }
 }

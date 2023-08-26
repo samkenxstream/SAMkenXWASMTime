@@ -1,36 +1,58 @@
-//! Implements the base structure (i.e. [WasiNnCtx]) that will provide the
-//! implementation of the wasi-nn API.
-use crate::api::{Backend, BackendError, BackendExecutionContext, BackendGraph};
-use crate::openvino::OpenvinoBackend;
-use crate::r#impl::UsageError;
-use crate::witx::types::{Graph, GraphEncoding, GraphExecutionContext};
-use std::collections::HashMap;
-use std::hash::Hash;
+//! Implements the host state for the `wasi-nn` API: [WasiNnCtx].
+
+use crate::backend::{self, BackendError};
+use crate::wit::types::GraphEncoding;
+use crate::{Backend, ExecutionContext, Graph, InMemoryRegistry, Registry};
+use anyhow::anyhow;
+use std::{collections::HashMap, hash::Hash, path::Path};
 use thiserror::Error;
 use wiggle::GuestError;
 
+type GraphId = u32;
+type GraphExecutionContextId = u32;
+type BackendName = String;
+type GraphDirectory = String;
+
+/// Construct an in-memory registry from the available backends and a list of
+/// `(<backend name>, <graph directory>)`. This assumes graphs can be loaded
+/// from a local directory, which is a safe assumption currently for the current
+/// model types.
+pub fn preload(
+    preload_graphs: &[(BackendName, GraphDirectory)],
+) -> anyhow::Result<(impl IntoIterator<Item = Backend>, Registry)> {
+    let mut backends = backend::list();
+    let mut registry = InMemoryRegistry::new();
+    for (kind, path) in preload_graphs {
+        let kind_ = kind.parse()?;
+        let backend = backends
+            .iter_mut()
+            .find(|b| b.encoding() == kind_)
+            .ok_or(anyhow!("unsupported backend: {}", kind))?
+            .as_dir_loadable()
+            .ok_or(anyhow!("{} does not support directory loading", kind))?;
+        registry.load(backend, Path::new(path))?;
+    }
+    Ok((backends, Registry::from(registry)))
+}
+
 /// Capture the state necessary for calling into the backend ML libraries.
 pub struct WasiNnCtx {
-    pub(crate) backends: HashMap<u8, Box<dyn Backend>>,
-    pub(crate) graphs: Table<Graph, Box<dyn BackendGraph>>,
-    pub(crate) executions: Table<GraphExecutionContext, Box<dyn BackendExecutionContext>>,
+    pub(crate) backends: HashMap<GraphEncoding, Backend>,
+    pub(crate) registry: Registry,
+    pub(crate) graphs: Table<GraphId, Graph>,
+    pub(crate) executions: Table<GraphExecutionContextId, ExecutionContext>,
 }
 
 impl WasiNnCtx {
     /// Make a new context from the default state.
-    pub fn new() -> WasiNnResult<Self> {
-        let mut backends = HashMap::new();
-        backends.insert(
-            // This is necessary because Wiggle's variant types do not derive
-            // `Hash` and `Eq`.
-            GraphEncoding::Openvino.into(),
-            Box::new(OpenvinoBackend::default()) as Box<dyn Backend>,
-        );
-        Ok(Self {
+    pub fn new(backends: impl IntoIterator<Item = Backend>, registry: Registry) -> Self {
+        let backends = backends.into_iter().map(|b| (b.encoding(), b)).collect();
+        Self {
             backends,
+            registry,
             graphs: Table::default(),
             executions: Table::default(),
-        })
+        }
     }
 }
 
@@ -43,6 +65,24 @@ pub enum WasiNnError {
     GuestError(#[from] GuestError),
     #[error("usage error")]
     UsageError(#[from] UsageError),
+}
+
+#[derive(Debug, Error)]
+pub enum UsageError {
+    #[error("Invalid context; has the load function been called?")]
+    InvalidContext,
+    #[error("Only OpenVINO's IR is currently supported, passed encoding: {0:?}")]
+    InvalidEncoding(GraphEncoding),
+    #[error("OpenVINO expects only two buffers (i.e. [ir, weights]), passed: {0}")]
+    InvalidNumberOfBuilders(u32),
+    #[error("Invalid graph handle; has it been loaded?")]
+    InvalidGraphHandle,
+    #[error("Invalid execution context handle; has it been initialized?")]
+    InvalidExecutionContextHandle,
+    #[error("Not enough memory to copy tensor data of size: {0}")]
+    NotEnoughMemory(u32),
+    #[error("No graph found with name: {0}")]
+    NotFound(String),
 }
 
 pub(crate) type WasiNnResult<T> = std::result::Result<T, WasiNnError>;
@@ -72,6 +112,10 @@ where
         key
     }
 
+    pub fn get(&self, key: K) -> Option<&V> {
+        self.entries.get(&key)
+    }
+
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         self.entries.get_mut(&key)
     }
@@ -86,9 +130,17 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::registry::GraphRegistry;
 
     #[test]
-    fn instantiate() {
-        WasiNnCtx::new().unwrap();
+    fn example() {
+        struct FakeRegistry;
+        impl GraphRegistry for FakeRegistry {
+            fn get_mut(&mut self, _: &str) -> Option<&mut Graph> {
+                None
+            }
+        }
+
+        let _ctx = WasiNnCtx::new([], Registry::from(FakeRegistry));
     }
 }

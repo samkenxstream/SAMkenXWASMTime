@@ -20,12 +20,12 @@
 use crate::fx::FxHashMap;
 use crate::fx::FxHashSet;
 use crate::ir::RelSourceLoc;
-use crate::ir::{self, types, Constant, ConstantData, DynamicStackSlot, LabelValueLoc, ValueLabel};
+use crate::ir::{self, types, Constant, ConstantData, DynamicStackSlot, ValueLabel};
 use crate::machinst::*;
 use crate::timing;
 use crate::trace;
 use crate::CodegenError;
-use crate::ValueLocRange;
+use crate::{LabelValueLoc, ValueLocRange};
 use cranelift_control::ControlPlane;
 use regalloc2::{
     Edit, Function as RegallocFunction, InstOrEdit, InstRange, Operand, OperandKind, PRegSet,
@@ -827,10 +827,11 @@ impl<I: VCodeInst> VCode<I> {
         }
 
         let is_forward_edge_cfi_enabled = self.abi.is_forward_edge_cfi_enabled();
-        let bb_padding = match flags.bb_padding_log2_minus_one() {
+        let mut bb_padding = match flags.bb_padding_log2_minus_one() {
             0 => Vec::new(),
             n => vec![0; 1 << (n - 1)],
         };
+        let mut total_bb_padding = 0;
 
         for (block_order_idx, &block) in final_order.iter().enumerate() {
             trace!("emitting block {:?}", block);
@@ -975,7 +976,7 @@ impl<I: VCodeInst> VCode<I> {
                         // (and don't emit the return; the actual
                         // epilogue will contain it).
                         if self.insts[iix.index()].is_term() == MachTerminator::Ret {
-                            for inst in self.abi.gen_epilogue() {
+                            for inst in self.abi.gen_epilogue(&self.sigs) {
                                 do_emit(&inst, &[], &mut disasm, &mut buffer, &mut state);
                             }
                         } else {
@@ -1054,9 +1055,19 @@ impl<I: VCodeInst> VCode<I> {
 
             // Insert padding, if configured, to stress the `MachBuffer`'s
             // relocation and island calculations.
+            //
+            // Padding can get quite large during fuzzing though so place a
+            // total cap on it where when a per-function threshold is exceeded
+            // the padding is turned back down to zero. This avoids a small-ish
+            // test case generating a GB+ memory footprint in Cranelift for
+            // example.
             if !bb_padding.is_empty() {
                 buffer.put_data(&bb_padding);
                 buffer.align_to(I::LabelUse::ALIGN);
+                total_bb_padding += bb_padding.len();
+                if total_bb_padding > (150 << 20) {
+                    bb_padding = Vec::new();
+                }
             }
         }
 
@@ -1255,8 +1266,8 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
         match self.insts[insn.index()].is_term() {
             // We treat blocks terminated by an unconditional trap like a return for regalloc.
             MachTerminator::None => self.insts[insn.index()].is_trap(),
-            MachTerminator::Ret => true,
-            _ => false,
+            MachTerminator::Ret | MachTerminator::RetCall => true,
+            MachTerminator::Uncond | MachTerminator::Cond | MachTerminator::Indirect => false,
         }
     }
 

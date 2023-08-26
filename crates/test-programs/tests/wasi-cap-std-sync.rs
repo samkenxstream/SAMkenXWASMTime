@@ -38,19 +38,19 @@ fn run(name: &str, inherit_stdio: bool) -> Result<()> {
         let mut builder = WasiCtxBuilder::new();
 
         if inherit_stdio {
-            builder = builder.inherit_stdio();
+            builder.inherit_stdio();
         } else {
-            builder = builder
+            builder
                 .stdout(Box::new(stdout.clone()))
                 .stderr(Box::new(stderr.clone()));
         }
-        builder = builder.arg(name)?.arg(".")?;
+        builder.arg(name)?.arg(".")?;
         println!("preopen: {:?}", workspace);
         let preopen_dir =
             cap_std::fs::Dir::open_ambient_dir(workspace.path(), cap_std::ambient_authority())?;
-        builder = builder.preopened_dir(preopen_dir, ".")?;
+        builder.preopened_dir(preopen_dir, ".")?;
         for (var, val) in test_programs::wasi_tests_environment() {
-            builder = builder.env(var, val)?;
+            builder.env(var, val)?;
         }
 
         let mut store = Store::new(&ENGINE, builder.build());
@@ -160,8 +160,8 @@ fn interesting_paths() {
     run("interesting_paths", true).unwrap()
 }
 #[test_log::test]
-fn isatty() {
-    run("isatty", true).unwrap()
+fn regular_file_isatty() {
+    run("regular_file_isatty", true).unwrap()
 }
 #[test_log::test]
 fn nofollow_errors() {
@@ -186,6 +186,10 @@ fn path_link() {
 #[test_log::test]
 fn path_open_create_existing() {
     run("path_open_create_existing", true).unwrap()
+}
+#[test_log::test]
+fn path_open_read_write() {
+    run("path_open_read_write", true).unwrap()
 }
 #[test_log::test]
 fn path_open_dirfd_not_dir() {
@@ -250,6 +254,19 @@ fn stdio() {
     run("stdio", true).unwrap()
 }
 #[test_log::test]
+fn stdio_isatty() {
+    if test_programs::stdio_is_terminal() {
+        // Inherit stdio, which is a terminal in the test runner's environment:
+        run("stdio_isatty", true).unwrap()
+    }
+}
+#[test_log::test]
+fn stdio_not_isatty() {
+    // Don't inherit stdio, test asserts each is not tty:
+    run("stdio_not_isatty", false).unwrap()
+}
+
+#[test_log::test]
 fn symlink_create() {
     run("symlink_create", true).unwrap()
 }
@@ -264,4 +281,8 @@ fn symlink_loop() {
 #[test_log::test]
 fn unlink_file_trailing_slashes() {
     run("unlink_file_trailing_slashes", true).unwrap()
+}
+#[test_log::test]
+fn path_open_preopen() {
+    run("path_open_preopen", true).unwrap()
 }

@@ -1,4 +1,4 @@
-use crate::{FuncEnv, TrampolineKind};
+use crate::TrampolineKind;
 use anyhow::{anyhow, Result};
 use core::fmt::Formatter;
 use cranelift_codegen::isa::{CallConv, IsaBuilder};
@@ -9,8 +9,8 @@ use std::{
     fmt::{self, Debug, Display},
 };
 use target_lexicon::{Architecture, Triple};
-use wasmparser::{FuncType, FuncValidator, FunctionBody, ValidatorResources};
-use wasmtime_environ::VMOffsets;
+use wasmparser::{FuncValidator, FunctionBody, ValidatorResources};
+use wasmtime_environ::{ModuleTranslation, WasmFuncType};
 
 #[cfg(feature = "x64")]
 pub(crate) mod x64;
@@ -80,10 +80,10 @@ pub(crate) enum LookupError {
 pub enum CallingConvention {
     /// See [cranelift_codegen::isa::CallConv::WasmtimeSystemV]
     WasmtimeSystemV,
-    /// See [cranelift_codegen::isa::CallConv::WasmtimeFastcall]
-    WasmtimeFastcall,
-    /// See [cranelift_codegen::isa::CallConv::WasmtimeAppleAarch64]
-    WasmtimeAppleAarch64,
+    /// See [cranelift_codegen::isa::CallConv::WindowsFastcall]
+    WindowsFastcall,
+    /// See [cranelift_codegen::isa::CallConv::AppleAarch64]
+    AppleAarch64,
     /// The default calling convention for Winch. It largely follows SystemV
     /// for parameter and result handling. This calling convention is part of
     /// Winch's default ABI [crate::abi::ABI].
@@ -94,7 +94,7 @@ impl CallingConvention {
     /// Returns true if the current calling convention is `WasmtimeFastcall`.
     fn is_fastcall(&self) -> bool {
         match &self {
-            CallingConvention::WasmtimeFastcall => true,
+            CallingConvention::WindowsFastcall => true,
             _ => false,
         }
     }
@@ -110,7 +110,7 @@ impl CallingConvention {
     /// Returns true if the current calling convention is `WasmtimeAppleAarch64`.
     fn is_apple_aarch64(&self) -> bool {
         match &self {
-            CallingConvention::WasmtimeAppleAarch64 => true,
+            CallingConvention::AppleAarch64 => true,
             _ => false,
         }
     }
@@ -147,10 +147,9 @@ pub trait TargetIsa: Send + Sync {
     /// Compile a function.
     fn compile_function(
         &self,
-        sig: &FuncType,
+        sig: &WasmFuncType,
         body: &FunctionBody,
-        vmoffsets: &VMOffsets<u8>,
-        env: &dyn FuncEnv,
+        translation: &ModuleTranslation,
         validator: &mut FuncValidator<ValidatorResources>,
     ) -> Result<MachBufferFinalized<Final>>;
 
@@ -163,9 +162,9 @@ pub trait TargetIsa: Send + Sync {
     /// calling convention.
     fn wasmtime_call_conv(&self) -> CallingConvention {
         match self.default_call_conv() {
-            CallConv::AppleAarch64 => CallingConvention::WasmtimeAppleAarch64,
+            CallConv::AppleAarch64 => CallingConvention::AppleAarch64,
             CallConv::SystemV => CallingConvention::WasmtimeSystemV,
-            CallConv::WindowsFastcall => CallingConvention::WasmtimeFastcall,
+            CallConv::WindowsFastcall => CallingConvention::WindowsFastcall,
             cc => unimplemented!("calling convention: {:?}", cc),
         }
     }
@@ -193,7 +192,7 @@ pub trait TargetIsa: Send + Sync {
     /// depending on the `kind` paramter.
     fn compile_trampoline(
         &self,
-        ty: &FuncType,
+        ty: &WasmFuncType,
         kind: TrampolineKind,
     ) -> Result<MachBufferFinalized<Final>>;
 

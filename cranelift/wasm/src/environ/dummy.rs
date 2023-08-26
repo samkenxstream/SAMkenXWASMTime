@@ -11,8 +11,8 @@ use crate::state::FuncTranslationState;
 use crate::WasmType;
 use crate::{
     DataIndex, DefinedFuncIndex, ElemIndex, FuncIndex, Global, GlobalIndex, GlobalInit, Heap,
-    HeapData, HeapStyle, Memory, MemoryIndex, Table, TableIndex, TypeIndex, WasmFuncType,
-    WasmResult,
+    HeapData, HeapStyle, Memory, MemoryIndex, Table, TableIndex, TypeConvert, TypeIndex,
+    WasmFuncType, WasmHeapType, WasmResult,
 };
 use core::convert::TryFrom;
 use cranelift_codegen::cursor::FuncCursor;
@@ -144,9 +144,6 @@ pub struct DummyEnvironment {
     /// Vector of wasm bytecode size for each function.
     pub func_bytecode_sizes: Vec<usize>,
 
-    /// Instructs to collect debug data during translation.
-    pub debug_info: bool,
-
     /// Name of the module from the wasm file.
     pub module_name: Option<String>,
 
@@ -160,12 +157,11 @@ pub struct DummyEnvironment {
 
 impl DummyEnvironment {
     /// Creates a new `DummyEnvironment` instance.
-    pub fn new(config: TargetFrontendConfig, debug_info: bool) -> Self {
+    pub fn new(config: TargetFrontendConfig) -> Self {
         Self {
             info: DummyModuleInfo::new(config),
             trans: FuncTranslator::new(),
             func_bytecode_sizes: Vec::new(),
-            debug_info,
             module_name: None,
             function_names: SecondaryMap::new(),
             expected_reachability: None,
@@ -251,6 +247,12 @@ impl<'dummy_environment> DummyFuncEnvironment<'dummy_environment> {
     }
 }
 
+impl<'dummy_environment> TypeConvert for DummyFuncEnvironment<'dummy_environment> {
+    fn lookup_heap_type(&self, _index: TypeIndex) -> WasmHeapType {
+        unimplemented!()
+    }
+}
+
 impl<'dummy_environment> TargetEnvironment for DummyFuncEnvironment<'dummy_environment> {
     fn target_config(&self) -> TargetFrontendConfig {
         self.mod_info.config
@@ -279,7 +281,7 @@ impl<'dummy_environment> FuncEnvironment for DummyFuncEnvironment<'dummy_environ
                 WasmType::F32 => ir::types::F32,
                 WasmType::F64 => ir::types::F64,
                 WasmType::V128 => ir::types::I8X16,
-                WasmType::FuncRef | WasmType::ExternRef => ir::types::R64,
+                WasmType::Ref(_) => ir::types::R64,
             },
         })
     }
@@ -442,15 +444,38 @@ impl<'dummy_environment> FuncEnvironment for DummyFuncEnvironment<'dummy_environ
             .0)
     }
 
+    fn translate_return_call_indirect(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _table_index: TableIndex,
+        _table: ir::Table,
+        _sig_index: TypeIndex,
+        _sig_ref: ir::SigRef,
+        _callee: ir::Value,
+        _call_args: &[ir::Value],
+    ) -> WasmResult<()> {
+        unimplemented!()
+    }
+
+    fn translate_return_call_ref(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _sig_ref: ir::SigRef,
+        _callee: ir::Value,
+        _call_args: &[ir::Value],
+    ) -> WasmResult<()> {
+        unimplemented!()
+    }
+
     fn translate_call(
         &mut self,
-        mut pos: FuncCursor,
+        builder: &mut FunctionBuilder,
         _callee_index: FuncIndex,
         callee: ir::FuncRef,
         call_args: &[ir::Value],
     ) -> WasmResult<ir::Inst> {
         // Pass the current function's vmctx parameter on to the callee.
-        let vmctx = pos
+        let vmctx = builder
             .func
             .special_param(ir::ArgumentPurpose::VMContext)
             .expect("Missing vmctx parameter");
@@ -458,10 +483,23 @@ impl<'dummy_environment> FuncEnvironment for DummyFuncEnvironment<'dummy_environ
         // Build a value list for the call instruction containing the call_args and the vmctx
         // parameter.
         let mut args = ir::ValueList::default();
-        args.extend(call_args.iter().cloned(), &mut pos.func.dfg.value_lists);
-        args.push(vmctx, &mut pos.func.dfg.value_lists);
+        args.extend(call_args.iter().cloned(), &mut builder.func.dfg.value_lists);
+        args.push(vmctx, &mut builder.func.dfg.value_lists);
 
-        Ok(pos.ins().Call(ir::Opcode::Call, INVALID, callee, args).0)
+        Ok(builder
+            .ins()
+            .Call(ir::Opcode::Call, INVALID, callee, args)
+            .0)
+    }
+
+    fn translate_call_ref(
+        &mut self,
+        _builder: &mut FunctionBuilder,
+        _sig_ref: ir::SigRef,
+        _callee: ir::Value,
+        _call_args: &[ir::Value],
+    ) -> WasmResult<ir::Inst> {
+        todo!("Implement dummy translate_call_ref")
     }
 
     fn translate_memory_grow(
@@ -658,6 +696,12 @@ impl<'dummy_environment> FuncEnvironment for DummyFuncEnvironment<'dummy_environ
     }
 }
 
+impl TypeConvert for DummyEnvironment {
+    fn lookup_heap_type(&self, _index: TypeIndex) -> WasmHeapType {
+        unimplemented!()
+    }
+}
+
 impl TargetEnvironment for DummyEnvironment {
     fn target_config(&self) -> TargetFrontendConfig {
         self.info.config
@@ -683,7 +727,7 @@ impl<'data> ModuleEnvironment<'data> for DummyEnvironment {
                 WasmType::F32 => ir::types::F32,
                 WasmType::F64 => ir::types::F64,
                 WasmType::V128 => ir::types::I8X16,
-                WasmType::FuncRef | WasmType::ExternRef => reference_type,
+                WasmType::Ref(_) => reference_type,
             })
         };
         sig.params.extend(wasm.params().iter().map(&mut cvt));
@@ -869,10 +913,6 @@ impl<'data> ModuleEnvironment<'data> for DummyEnvironment {
             let sig = func_environ.vmctx_sig(self.get_func_type(func_index));
             let mut func =
                 ir::Function::with_name_signature(UserFuncName::user(0, func_index.as_u32()), sig);
-
-            if self.debug_info {
-                func.collect_debug_info();
-            }
 
             self.trans
                 .translate_body(&mut validator, body, &mut func, &mut func_environ)?;

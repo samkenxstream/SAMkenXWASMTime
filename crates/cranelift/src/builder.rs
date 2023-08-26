@@ -12,13 +12,15 @@ use std::fmt;
 use std::path;
 use std::sync::Arc;
 use wasmtime_cranelift_shared::isa_builder::IsaBuilder;
-use wasmtime_environ::{CacheStore, CompilerBuilder, Setting};
+use wasmtime_environ::{CacheStore, CompilerBuilder, Setting, Tunables};
 
 struct Builder {
+    tunables: Tunables,
     inner: IsaBuilder<CodegenResult<OwnedTargetIsa>>,
     linkopts: LinkOptions,
     cache_store: Option<Arc<dyn CacheStore>>,
     clif_dir: Option<path::PathBuf>,
+    wmemcheck: bool,
 }
 
 #[derive(Clone, Default)]
@@ -36,10 +38,12 @@ pub struct LinkOptions {
 
 pub fn builder() -> Box<dyn CompilerBuilder> {
     Box::new(Builder {
+        tunables: Tunables::default(),
         inner: IsaBuilder::new(|triple| isa::lookup(triple).map_err(|e| e.into())),
         linkopts: LinkOptions::default(),
         cache_store: None,
         clif_dir: None,
+        wmemcheck: false,
     })
 }
 
@@ -76,13 +80,20 @@ impl CompilerBuilder for Builder {
         self.inner.enable(name)
     }
 
+    fn set_tunables(&mut self, tunables: Tunables) -> Result<()> {
+        self.tunables = tunables;
+        Ok(())
+    }
+
     fn build(&self) -> Result<Box<dyn wasmtime_environ::Compiler>> {
         let isa = self.inner.build()?;
         Ok(Box::new(crate::compiler::Compiler::new(
+            self.tunables.clone(),
             isa,
             self.cache_store.clone(),
             self.linkopts.clone(),
             self.clif_dir.clone(),
+            self.wmemcheck,
         )))
     }
 
@@ -96,6 +107,10 @@ impl CompilerBuilder for Builder {
     ) -> Result<()> {
         self.cache_store = Some(cache_store);
         Ok(())
+    }
+
+    fn wmemcheck(&mut self, enable: bool) {
+        self.wmemcheck = enable;
     }
 }
 

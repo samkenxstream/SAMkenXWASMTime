@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use syn::parse::{Error, Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::{braced, token, Ident, Token};
-use wasmtime_wit_bindgen::{Opts, TrappableError};
+use wasmtime_wit_bindgen::{Opts, Ownership, TrappableError};
 use wit_parser::{PackageId, Resolve, UnresolvedPackage, WorldId};
 
 pub struct Config {
@@ -73,12 +73,21 @@ impl Parse for Config {
                     Opt::Tracing(val) => opts.tracing = val,
                     Opt::Async(val) => opts.async_ = val,
                     Opt::TrappableErrorType(val) => opts.trappable_error_type = val,
-                    Opt::DuplicateIfNecessary(val) => opts.duplicate_if_necessary = val,
+                    Opt::Ownership(val) => opts.ownership = val,
                     Opt::Interfaces(s) => {
                         if inline.is_some() {
                             return Err(Error::new(s.span(), "cannot specify a second source"));
                         }
-                        inline = Some(format!("default world interfaces {{ {} }}", s.value()));
+                        inline = Some(format!(
+                            "
+                                package wasmtime:component-macro-synthesized
+
+                                world interfaces {{
+                                    {}
+                                }}
+                            ",
+                            s.value()
+                        ));
 
                         if world.is_some() {
                             return Err(Error::new(
@@ -86,7 +95,7 @@ impl Parse for Config {
                                 "cannot specify a world with `interfaces`",
                             ));
                         }
-                        world = Some("macro-input.interfaces".to_string());
+                        world = Some("interfaces".to_string());
 
                         opts.only_interfaces = true;
                     }
@@ -130,7 +139,7 @@ fn parse_source(
         } else {
             let pkg = UnresolvedPackage::parse_file(path)?;
             files.extend(pkg.source_files().map(|s| s.to_owned()));
-            resolve.push(pkg, &Default::default())
+            resolve.push(pkg)
         }
     };
 
@@ -141,16 +150,7 @@ fn parse_source(
     };
 
     let inline_pkg = if let Some(inline) = inline {
-        let deps = resolve
-            .packages
-            .iter()
-            .map(|(id, p)| (p.name.clone(), id))
-            .collect();
-
-        Some(resolve.push(
-            UnresolvedPackage::parse("macro-input".as_ref(), &inline)?,
-            &deps,
-        )?)
+        Some(resolve.push(UnresolvedPackage::parse("macro-input".as_ref(), &inline)?)?)
     } else {
         None
     };
@@ -168,7 +168,7 @@ mod kw {
     syn::custom_keyword!(tracing);
     syn::custom_keyword!(trappable_error_type);
     syn::custom_keyword!(world);
-    syn::custom_keyword!(duplicate_if_necessary);
+    syn::custom_keyword!(ownership);
     syn::custom_keyword!(interfaces);
     syn::custom_keyword!(with);
 }
@@ -180,7 +180,7 @@ enum Opt {
     Tracing(bool),
     Async(bool),
     TrappableErrorType(Vec<TrappableError>),
-    DuplicateIfNecessary(bool),
+    Ownership(Ownership),
     Interfaces(syn::LitStr),
     With(HashMap<String, String>),
 }
@@ -208,29 +208,52 @@ impl Parse for Opt {
             input.parse::<Token![async]>()?;
             input.parse::<Token![:]>()?;
             Ok(Opt::Async(input.parse::<syn::LitBool>()?.value))
-        } else if l.peek(kw::duplicate_if_necessary) {
-            input.parse::<kw::duplicate_if_necessary>()?;
+        } else if l.peek(kw::ownership) {
+            input.parse::<kw::ownership>()?;
             input.parse::<Token![:]>()?;
-            Ok(Opt::DuplicateIfNecessary(
-                input.parse::<syn::LitBool>()?.value,
-            ))
+            let ownership = input.parse::<syn::Ident>()?;
+            Ok(Opt::Ownership(match ownership.to_string().as_str() {
+                "Owning" => Ownership::Owning,
+                "Borrowing" => Ownership::Borrowing {
+                    duplicate_if_necessary: {
+                        let contents;
+                        braced!(contents in input);
+                        let field = contents.parse::<syn::Ident>()?;
+                        match field.to_string().as_str() {
+                            "duplicate_if_necessary" => {
+                                contents.parse::<Token![:]>()?;
+                                contents.parse::<syn::LitBool>()?.value
+                            }
+                            name => {
+                                return Err(Error::new(
+                                    field.span(),
+                                    format!(
+                                        "unrecognized `Ownership::Borrowing` field: `{name}`; \
+                                         expected `duplicate_if_necessary`"
+                                    ),
+                                ));
+                            }
+                        }
+                    },
+                },
+                name => {
+                    return Err(Error::new(
+                        ownership.span(),
+                        format!(
+                            "unrecognized ownership: `{name}`; \
+                             expected `Owning` or `Borrowing`"
+                        ),
+                    ));
+                }
+            }))
         } else if l.peek(kw::trappable_error_type) {
             input.parse::<kw::trappable_error_type>()?;
             input.parse::<Token![:]>()?;
             let contents;
             let _lbrace = braced!(contents in input);
-            let fields: Punctuated<(String, String, String), Token![,]> =
-                contents.parse_terminated(trappable_error_field_parse)?;
-            Ok(Opt::TrappableErrorType(
-                fields
-                    .into_iter()
-                    .map(|(wit_owner, wit_name, rust_name)| TrappableError {
-                        wit_owner: Some(wit_owner),
-                        wit_name,
-                        rust_name,
-                    })
-                    .collect(),
-            ))
+            let fields: Punctuated<_, Token![,]> =
+                contents.parse_terminated(trappable_error_field_parse, Token![,])?;
+            Ok(Opt::TrappableErrorType(Vec::from_iter(fields.into_iter())))
         } else if l.peek(kw::interfaces) {
             input.parse::<kw::interfaces>()?;
             input.parse::<Token![:]>()?;
@@ -241,7 +264,7 @@ impl Parse for Opt {
             let contents;
             let _lbrace = braced!(contents in input);
             let fields: Punctuated<(String, String), Token![,]> =
-                contents.parse_terminated(with_field_parse)?;
+                contents.parse_terminated(with_field_parse, Token![,])?;
             Ok(Opt::With(HashMap::from_iter(fields.into_iter())))
         } else {
             Err(l.error())
@@ -249,7 +272,7 @@ impl Parse for Opt {
     }
 }
 
-fn trappable_error_field_parse(input: ParseStream<'_>) -> Result<(String, String, String)> {
+fn trappable_error_field_parse(input: ParseStream<'_>) -> Result<TrappableError> {
     // Accept a Rust identifier or a string literal. This is required
     // because not all wit identifiers are Rust identifiers, so we can
     // smuggle the invalid ones inside quotes.
@@ -264,12 +287,16 @@ fn trappable_error_field_parse(input: ParseStream<'_>) -> Result<(String, String
         }
     }
 
-    let interface = ident_or_str(input)?;
+    let wit_package_path = input.parse::<syn::LitStr>()?.value();
     input.parse::<Token![::]>()?;
-    let type_ = ident_or_str(input)?;
+    let wit_type_name = ident_or_str(input)?;
     input.parse::<Token![:]>()?;
-    let rust_type = input.parse::<Ident>()?.to_string();
-    Ok((interface, type_, rust_type))
+    let rust_type_name = input.parse::<Ident>()?.to_string();
+    Ok(TrappableError {
+        wit_package_path,
+        wit_type_name,
+        rust_type_name,
+    })
 }
 
 fn with_field_parse(input: ParseStream<'_>) -> Result<(String, String)> {

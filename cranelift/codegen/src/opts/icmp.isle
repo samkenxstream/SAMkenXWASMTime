@@ -22,7 +22,7 @@
 (rule (simplify (eq ty
                       (uextend _ (icmp ty cc x y))
                       (iconst _ (u64_from_imm64 0))))
-      (subsume (icmp ty (intcc_inverse cc) x y)))
+      (subsume (icmp ty (intcc_complement cc) x y)))
 
 ;; Optimize select-of-uextend-of-icmp to select-of-icmp, because
 ;; select can take an I8 condition too.
@@ -125,11 +125,11 @@
        (eq bty x smax))
 
 ;; `band`/`bor` of 2 comparisons:
-(rule (simplify (band ty (icmp ty cc1 x y) (icmp ty cc2 x y)))
+(rule (simplify (band (fits_in_64 ty) (icmp ty cc1 x y) (icmp ty cc2 x y)))
   (if-let signed (intcc_comparable cc1 cc2))
   (compose_icmp ty (u64_and (decompose_intcc cc1) (decompose_intcc cc2)) signed x y))
 
-(rule (simplify (bor ty (icmp ty cc1 x y) (icmp ty cc2 x y)))
+(rule (simplify (bor (fits_in_64 ty) (icmp ty cc1 x y) (icmp ty cc2 x y)))
   (if-let signed (intcc_comparable cc1 cc2))
   (compose_icmp ty (u64_or (decompose_intcc cc1) (decompose_intcc cc2)) signed x y))
 

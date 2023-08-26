@@ -81,7 +81,6 @@ use crate::translation_utils::{
 };
 use crate::wasm_unsupported;
 use crate::{FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TypeIndex, WasmResult};
-use core::convert::TryInto;
 use core::{i32, u32};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Offset32;
@@ -209,6 +208,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
                     }
                     debug_assert_eq!(ty, builder.func.dfg.value_type(val));
                     builder.ins().store(flags, val, addr, offset);
+                    environ.update_global(builder, *global_index, val);
                 }
                 GlobalVariable::Custom => {
                     let val = state.pop1();
@@ -589,6 +589,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             };
             {
                 let return_args = state.peekn_mut(return_count);
+                environ.handle_before_return(&return_args, builder);
                 bitcast_wasm_returns(environ, return_args, builder);
                 builder.ins().return_(return_args);
             }
@@ -625,7 +626,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             );
 
             let call = environ.translate_call(
-                builder.cursor(),
+                builder,
                 FuncIndex::from_u32(*function_index),
                 fref,
                 args,
@@ -675,6 +676,79 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.popn(num_args);
             state.pushn(inst_results);
         }
+        /******************************* Tail Calls ******************************************
+         * The tail call instructions pop their arguments from the stack and
+         * then permanently transfer control to their callee. The indirect
+         * version requires environment support (while the direct version can
+         * optionally be hooked but doesn't require it) it interacts with the
+         * VM's runtime state via tables.
+         ************************************************************************************/
+        Operator::ReturnCall { function_index } => {
+            let (fref, num_args) = state.get_direct_func(builder.func, *function_index, environ)?;
+
+            // Bitcast any vector arguments to their default type, I8X16, before calling.
+            let args = state.peekn_mut(num_args);
+            bitcast_wasm_params(
+                environ,
+                builder.func.dfg.ext_funcs[fref].signature,
+                args,
+                builder,
+            );
+
+            environ.translate_return_call(
+                builder,
+                FuncIndex::from_u32(*function_index),
+                fref,
+                args,
+            )?;
+
+            state.popn(num_args);
+            state.reachable = false;
+        }
+        Operator::ReturnCallIndirect {
+            type_index,
+            table_index,
+        } => {
+            // `type_index` is the index of the function's signature and
+            // `table_index` is the index of the table to search the function
+            // in.
+            let (sigref, num_args) = state.get_indirect_sig(builder.func, *type_index, environ)?;
+            let table = state.get_or_create_table(builder.func, *table_index, environ)?;
+            let callee = state.pop1();
+
+            // Bitcast any vector arguments to their default type, I8X16, before calling.
+            let args = state.peekn_mut(num_args);
+            bitcast_wasm_params(environ, sigref, args, builder);
+
+            environ.translate_return_call_indirect(
+                builder,
+                TableIndex::from_u32(*table_index),
+                table,
+                TypeIndex::from_u32(*type_index),
+                sigref,
+                callee,
+                state.peekn(num_args),
+            )?;
+
+            state.popn(num_args);
+            state.reachable = false;
+        }
+        Operator::ReturnCallRef { type_index } => {
+            // Get function signature
+            // `index` is the index of the function's signature and `table_index` is the index of
+            // the table to search the function in.
+            let (sigref, num_args) = state.get_indirect_sig(builder.func, *type_index, environ)?;
+            let callee = state.pop1();
+
+            // Bitcast any vector arguments to their default type, I8X16, before calling.
+            let args = state.peekn_mut(num_args);
+            bitcast_wasm_params(environ, sigref, args, builder);
+
+            environ.translate_return_call_ref(builder, sigref, callee, state.peekn(num_args))?;
+
+            state.popn(num_args);
+            state.reachable = false;
+        }
         /******************************* Memory management ***********************************
          * Memory management is handled by environment. It is usually translated into calls to
          * special functions.
@@ -685,6 +759,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let heap_index = MemoryIndex::from_u32(*mem);
             let heap = state.get_heap(builder.func, *mem, environ)?;
             let val = state.pop1();
+            environ.before_memory_grow(builder, val, heap_index);
             state.push1(environ.translate_memory_grow(builder.cursor(), heap_index, heap, val)?)
         }
         Operator::MemorySize { mem, mem_byte: _ } => {
@@ -787,7 +862,8 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             );
         }
         Operator::V128Load8x8S { memarg } => {
-            let (flags, base) = unwrap_or_return_unreachable_state!(
+            //TODO(#6829): add before_load() and before_store() hooks for SIMD loads and stores.
+            let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 state,
                 prepare_addr(memarg, 8, builder, state, environ)?
             );
@@ -795,7 +871,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.push1(loaded);
         }
         Operator::V128Load8x8U { memarg } => {
-            let (flags, base) = unwrap_or_return_unreachable_state!(
+            let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 state,
                 prepare_addr(memarg, 8, builder, state, environ)?
             );
@@ -803,7 +879,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.push1(loaded);
         }
         Operator::V128Load16x4S { memarg } => {
-            let (flags, base) = unwrap_or_return_unreachable_state!(
+            let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 state,
                 prepare_addr(memarg, 8, builder, state, environ)?
             );
@@ -811,7 +887,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.push1(loaded);
         }
         Operator::V128Load16x4U { memarg } => {
-            let (flags, base) = unwrap_or_return_unreachable_state!(
+            let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 state,
                 prepare_addr(memarg, 8, builder, state, environ)?
             );
@@ -819,7 +895,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.push1(loaded);
         }
         Operator::V128Load32x2S { memarg } => {
-            let (flags, base) = unwrap_or_return_unreachable_state!(
+            let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 state,
                 prepare_addr(memarg, 8, builder, state, environ)?
             );
@@ -827,7 +903,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.push1(loaded);
         }
         Operator::V128Load32x2U { memarg } => {
-            let (flags, base) = unwrap_or_return_unreachable_state!(
+            let (flags, _, base) = unwrap_or_return_unreachable_state!(
                 state,
                 prepare_addr(memarg, 8, builder, state, environ)?
             );
@@ -1152,7 +1228,8 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             translate_fcmp(FloatCC::LessThanOrEqual, builder, state)
         }
         Operator::RefNull { hty } => {
-            state.push1(environ.translate_ref_null(builder.cursor(), (*hty).try_into()?)?)
+            let hty = environ.convert_heap_type(*hty);
+            state.push1(environ.translate_ref_null(builder.cursor(), hty)?)
         }
         Operator::RefIsNull => {
             let value = state.pop1();
@@ -1879,12 +1956,29 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             state.push1(builder.ins().fmin(a, b))
         }
         Operator::F32x4PMax | Operator::F64x2PMax => {
-            let (a, b) = pop2_with_bitcast(state, type_of(op), builder);
-            state.push1(builder.ins().fmax_pseudo(a, b))
+            // Note the careful ordering here with respect to `fcmp` and
+            // `bitselect`. This matches the spec definition of:
+            //
+            //  fpmax(z1, z2) =
+            //      * If z1 is less than z2 then return z2.
+            //      * Else return z1.
+            let ty = type_of(op);
+            let (a, b) = pop2_with_bitcast(state, ty, builder);
+            let cmp = builder.ins().fcmp(FloatCC::LessThan, a, b);
+            let cmp = optionally_bitcast_vector(cmp, ty, builder);
+            state.push1(builder.ins().bitselect(cmp, b, a))
         }
         Operator::F32x4PMin | Operator::F64x2PMin => {
-            let (a, b) = pop2_with_bitcast(state, type_of(op), builder);
-            state.push1(builder.ins().fmin_pseudo(a, b))
+            // Note the careful ordering here which is similar to `pmax` above:
+            //
+            //  fpmin(z1, z2) =
+            //      * If z2 is less than z1 then return z2.
+            //      * Else return z1.
+            let ty = type_of(op);
+            let (a, b) = pop2_with_bitcast(state, ty, builder);
+            let cmp = builder.ins().fcmp(FloatCC::LessThan, b, a);
+            let cmp = optionally_bitcast_vector(cmp, ty, builder);
+            state.push1(builder.ins().bitselect(cmp, b, a))
         }
         Operator::F32x4Sqrt | Operator::F64x2Sqrt => {
             let a = pop1_with_bitcast(state, type_of(op), builder);
@@ -1908,7 +2002,8 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         }
         Operator::F64x2ConvertLowI32x4S => {
             let a = pop1_with_bitcast(state, I32X4, builder);
-            state.push1(builder.ins().fcvt_low_from_sint(F64X2, a));
+            let widened_a = builder.ins().swiden_low(a);
+            state.push1(builder.ins().fcvt_from_sint(F64X2, widened_a));
         }
         Operator::F64x2ConvertLowI32x4U => {
             let a = pop1_with_bitcast(state, I32X4, builder);
@@ -2157,9 +2252,6 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             let b_high = builder.ins().uwiden_high(b);
             state.push1(builder.ins().imul(a_high, b_high));
         }
-        Operator::ReturnCall { .. } | Operator::ReturnCallIndirect { .. } => {
-            return Err(wasm_unsupported!("proposed tail-call operator {:?}", op));
-        }
         Operator::MemoryDiscard { .. } => {
             return Err(wasm_unsupported!(
                 "proposed memory-control operator {:?}",
@@ -2168,27 +2260,39 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         }
 
         Operator::F32x4RelaxedMax | Operator::F64x2RelaxedMax => {
-            let (a, b) = pop2_with_bitcast(state, type_of(op), builder);
+            let ty = type_of(op);
+            let (a, b) = pop2_with_bitcast(state, ty, builder);
             state.push1(
                 if environ.relaxed_simd_deterministic() || !environ.is_x86() {
                     // Deterministic semantics match the `fmax` instruction, or
                     // the `fAAxBB.max` wasm instruction.
                     builder.ins().fmax(a, b)
                 } else {
-                    builder.ins().fmax_pseudo(a, b)
+                    // Note that this matches the `pmax` translation which has
+                    // careful ordering of its operands to trigger
+                    // pattern-matches in the x86 backend.
+                    let cmp = builder.ins().fcmp(FloatCC::LessThan, a, b);
+                    let cmp = optionally_bitcast_vector(cmp, ty, builder);
+                    builder.ins().bitselect(cmp, b, a)
                 },
             )
         }
 
         Operator::F32x4RelaxedMin | Operator::F64x2RelaxedMin => {
-            let (a, b) = pop2_with_bitcast(state, type_of(op), builder);
+            let ty = type_of(op);
+            let (a, b) = pop2_with_bitcast(state, ty, builder);
             state.push1(
                 if environ.relaxed_simd_deterministic() || !environ.is_x86() {
                     // Deterministic semantics match the `fmin` instruction, or
                     // the `fAAxBB.min` wasm instruction.
                     builder.ins().fmin(a, b)
                 } else {
-                    builder.ins().fmin_pseudo(a, b)
+                    // Note that this matches the `pmin` translation which has
+                    // careful ordering of its operands to trigger
+                    // pattern-matches in the x86 backend.
+                    let cmp = builder.ins().fcmp(FloatCC::LessThan, b, a);
+                    let cmp = optionally_bitcast_vector(cmp, ty, builder);
+                    builder.ins().bitselect(cmp, b, a)
                 },
             );
         }
@@ -2196,7 +2300,9 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         Operator::I8x16RelaxedSwizzle => {
             let (a, b) = pop2_with_bitcast(state, I8X16, builder);
             state.push1(
-                if environ.relaxed_simd_deterministic() || !environ.is_x86() {
+                if environ.relaxed_simd_deterministic()
+                    || !environ.use_x86_pshufb_for_relaxed_swizzle()
+                {
                     // Deterministic semantics match the `i8x16.swizzle`
                     // instruction which is the CLIF `swizzle`.
                     builder.ins().swizzle(a, b)
@@ -2243,12 +2349,10 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             // Note that the variable swaps here are intentional due to
             // the difference of the order of the wasm op and the clif
             // op.
-            //
-            // Additionally note that even on x86 the I16X8 type uses the
-            // `bitselect` instruction since x86 has no corresponding
-            // `blendv`-style instruction for 16-bit operands.
             state.push1(
-                if environ.relaxed_simd_deterministic() || !environ.is_x86() || ty == I16X8 {
+                if environ.relaxed_simd_deterministic()
+                    || !environ.use_x86_blendv_for_relaxed_laneselect(ty)
+                {
                     // Deterministic semantics are a `bitselect` along the lines
                     // of the wasm `v128.bitselect` instruction.
                     builder.ins().bitselect(c, a, b)
@@ -2287,7 +2391,9 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         Operator::I16x8RelaxedQ15mulrS => {
             let (a, b) = pop2_with_bitcast(state, I16X8, builder);
             state.push1(
-                if environ.relaxed_simd_deterministic() || !environ.is_x86() {
+                if environ.relaxed_simd_deterministic()
+                    || !environ.use_x86_pmulhrsw_for_relaxed_q15mul()
+                {
                     // Deterministic semantics are to match the
                     // `i16x8.q15mulr_sat_s` instruction.
                     builder.ins().sqmul_round_sat(a, b)
@@ -2299,7 +2405,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         Operator::I16x8RelaxedDotI8x16I7x16S => {
             let (a, b) = pop2_with_bitcast(state, I8X16, builder);
             state.push1(
-                if environ.relaxed_simd_deterministic() || !environ.is_x86() {
+                if environ.relaxed_simd_deterministic() || !environ.use_x86_pmaddubsw_for_dot() {
                     // Deterministic semantics are to treat both operands as
                     // signed integers and perform the dot product.
                     let alo = builder.ins().swiden_low(a);
@@ -2318,35 +2424,88 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         Operator::I32x4RelaxedDotI8x16I7x16AddS => {
             let c = pop1_with_bitcast(state, I32X4, builder);
             let (a, b) = pop2_with_bitcast(state, I8X16, builder);
-            let dot = if environ.relaxed_simd_deterministic() || !environ.is_x86() {
-                // Deterministic semantics are to treat both operands as
-                // signed integers and perform the dot product.
-                let alo = builder.ins().swiden_low(a);
-                let blo = builder.ins().swiden_low(b);
-                let lo = builder.ins().imul(alo, blo);
-                let ahi = builder.ins().swiden_high(a);
-                let bhi = builder.ins().swiden_high(b);
-                let hi = builder.ins().imul(ahi, bhi);
-                builder.ins().iadd_pairwise(lo, hi)
-            } else {
-                builder.ins().x86_pmaddubsw(a, b)
-            };
+            let dot =
+                if environ.relaxed_simd_deterministic() || !environ.use_x86_pmaddubsw_for_dot() {
+                    // Deterministic semantics are to treat both operands as
+                    // signed integers and perform the dot product.
+                    let alo = builder.ins().swiden_low(a);
+                    let blo = builder.ins().swiden_low(b);
+                    let lo = builder.ins().imul(alo, blo);
+                    let ahi = builder.ins().swiden_high(a);
+                    let bhi = builder.ins().swiden_high(b);
+                    let hi = builder.ins().imul(ahi, bhi);
+                    builder.ins().iadd_pairwise(lo, hi)
+                } else {
+                    builder.ins().x86_pmaddubsw(a, b)
+                };
             let dotlo = builder.ins().swiden_low(dot);
             let dothi = builder.ins().swiden_high(dot);
             let dot32 = builder.ins().iadd_pairwise(dotlo, dothi);
             state.push1(builder.ins().iadd(dot32, c));
         }
 
-        Operator::CallRef { .. }
-        | Operator::ReturnCallRef { .. }
-        | Operator::BrOnNull { .. }
-        | Operator::BrOnNonNull { .. }
-        | Operator::RefAsNonNull => {
-            return Err(wasm_unsupported!(
-                "proposed function-references operator {:?}",
-                op
-            ));
+        Operator::BrOnNull { relative_depth } => {
+            let r = state.pop1();
+            let (br_destination, inputs) = translate_br_if_args(*relative_depth, state);
+            let is_null = environ.translate_ref_is_null(builder.cursor(), r)?;
+            let else_block = builder.create_block();
+            canonicalise_brif(builder, is_null, br_destination, inputs, else_block, &[]);
+
+            builder.seal_block(else_block); // The only predecessor is the current block.
+            builder.switch_to_block(else_block);
+            state.push1(r);
         }
+        Operator::BrOnNonNull { relative_depth } => {
+            // We write this a bit differently from the spec to avoid an extra
+            // block/branch and the typed accounting thereof. Instead of the
+            // spec's approach, it's described as such:
+            // Peek the value val from the stack.
+            // If val is ref.null ht, then: pop the value val from the stack.
+            // Else: Execute the instruction (br relative_depth).
+            let is_null = environ.translate_ref_is_null(builder.cursor(), state.peek1())?;
+            let (br_destination, inputs) = translate_br_if_args(*relative_depth, state);
+            let else_block = builder.create_block();
+            canonicalise_brif(builder, is_null, else_block, &[], br_destination, inputs);
+
+            // In the null case, pop the ref
+            state.pop1();
+
+            builder.seal_block(else_block); // The only predecessor is the current block.
+
+            // The rest of the translation operates on our is null case, which is
+            // currently an empty block
+            builder.switch_to_block(else_block);
+        }
+        Operator::CallRef { type_index } => {
+            // Get function signature
+            // `index` is the index of the function's signature and `table_index` is the index of
+            // the table to search the function in.
+            let (sigref, num_args) = state.get_indirect_sig(builder.func, *type_index, environ)?;
+            let callee = state.pop1();
+
+            // Bitcast any vector arguments to their default type, I8X16, before calling.
+            let args = state.peekn_mut(num_args);
+            bitcast_wasm_params(environ, sigref, args, builder);
+
+            let call =
+                environ.translate_call_ref(builder, sigref, callee, state.peekn(num_args))?;
+
+            let inst_results = builder.inst_results(call);
+            debug_assert_eq!(
+                inst_results.len(),
+                builder.func.dfg.signatures[sigref].returns.len(),
+                "translate_call_ref results should match the call signature"
+            );
+            state.popn(num_args);
+            state.pushn(inst_results);
+        }
+        Operator::RefAsNonNull => {
+            let r = state.pop1();
+            let is_null = environ.translate_ref_is_null(builder.cursor(), r)?;
+            builder.ins().trapnz(is_null, ir::TrapCode::NullReference);
+            state.push1(r);
+        }
+
         Operator::I31New | Operator::I31GetS | Operator::I31GetU => {
             unimplemented!("GC operators not yet implemented")
         }
@@ -2505,13 +2664,15 @@ fn translate_unreachable_operator<FE: FuncEnvironment + ?Sized>(
 /// heap address if execution reaches that point.
 ///
 /// Returns `None` when the Wasm access will unconditionally trap.
+///
+/// Returns `(flags, wasm_addr, native_addr)`.
 fn prepare_addr<FE>(
     memarg: &MemArg,
     access_size: u8,
     builder: &mut FunctionBuilder,
     state: &mut FuncTranslationState,
     environ: &mut FE,
-) -> WasmResult<Reachability<(MemFlags, Value)>>
+) -> WasmResult<Reachability<(MemFlags, Value, Value)>>
 where
     FE: FuncEnvironment + ?Sized,
 {
@@ -2661,7 +2822,7 @@ where
     // vmctx, stack) accesses.
     flags.set_heap();
 
-    Ok(Reachability::Reachable((flags, addr)))
+    Ok(Reachability::Reachable((flags, index, addr)))
 }
 
 fn align_atomic_addr(
@@ -2708,7 +2869,7 @@ fn prepare_atomic_addr<FE: FuncEnvironment + ?Sized>(
     builder: &mut FunctionBuilder,
     state: &mut FuncTranslationState,
     environ: &mut FE,
-) -> WasmResult<Reachability<(MemFlags, Value)>> {
+) -> WasmResult<Reachability<(MemFlags, Value, Value)>> {
     align_atomic_addr(memarg, loaded_bytes, builder, state);
     prepare_addr(memarg, loaded_bytes, builder, state, environ)
 }
@@ -2740,16 +2901,15 @@ fn translate_load<FE: FuncEnvironment + ?Sized>(
     state: &mut FuncTranslationState,
     environ: &mut FE,
 ) -> WasmResult<Reachability<()>> {
-    let (flags, base) = match prepare_addr(
-        memarg,
-        mem_op_size(opcode, result_ty),
-        builder,
-        state,
-        environ,
-    )? {
-        Reachability::Unreachable => return Ok(Reachability::Unreachable),
-        Reachability::Reachable((f, b)) => (f, b),
-    };
+    let mem_op_size = mem_op_size(opcode, result_ty);
+    let (flags, wasm_index, base) =
+        match prepare_addr(memarg, mem_op_size, builder, state, environ)? {
+            Reachability::Unreachable => return Ok(Reachability::Unreachable),
+            Reachability::Reachable((f, i, b)) => (f, i, b),
+        };
+
+    environ.before_load(builder, mem_op_size, wasm_index, memarg.offset);
+
     let (load, dfg) = builder
         .ins()
         .Load(opcode, result_ty, flags, Offset32::new(0), base);
@@ -2767,11 +2927,15 @@ fn translate_store<FE: FuncEnvironment + ?Sized>(
 ) -> WasmResult<()> {
     let val = state.pop1();
     let val_ty = builder.func.dfg.value_type(val);
+    let mem_op_size = mem_op_size(opcode, val_ty);
 
-    let (flags, base) = unwrap_or_return_unreachable_state!(
+    let (flags, wasm_index, base) = unwrap_or_return_unreachable_state!(
         state,
-        prepare_addr(memarg, mem_op_size(opcode, val_ty), builder, state, environ)?
+        prepare_addr(memarg, mem_op_size, builder, state, environ)?
     );
+
+    environ.before_store(builder, mem_op_size, wasm_index, memarg.offset);
+
     builder
         .ins()
         .Store(opcode, val_ty, flags, Offset32::new(0), val, base);
@@ -2828,7 +2992,7 @@ fn translate_atomic_rmw<FE: FuncEnvironment + ?Sized>(
         arg2 = builder.ins().ireduce(access_ty, arg2);
     }
 
-    let (flags, addr) = unwrap_or_return_unreachable_state!(
+    let (flags, _, addr) = unwrap_or_return_unreachable_state!(
         state,
         prepare_atomic_addr(
             memarg,
@@ -2885,7 +3049,7 @@ fn translate_atomic_cas<FE: FuncEnvironment + ?Sized>(
         replacement = builder.ins().ireduce(access_ty, replacement);
     }
 
-    let (flags, addr) = unwrap_or_return_unreachable_state!(
+    let (flags, _, addr) = unwrap_or_return_unreachable_state!(
         state,
         prepare_atomic_addr(
             memarg,
@@ -2928,7 +3092,7 @@ fn translate_atomic_load<FE: FuncEnvironment + ?Sized>(
     };
     assert!(w_ty_ok && widened_ty.bytes() >= access_ty.bytes());
 
-    let (flags, addr) = unwrap_or_return_unreachable_state!(
+    let (flags, _, addr) = unwrap_or_return_unreachable_state!(
         state,
         prepare_atomic_addr(
             memarg,
@@ -2977,7 +3141,7 @@ fn translate_atomic_store<FE: FuncEnvironment + ?Sized>(
         data = builder.ins().ireduce(access_ty, data);
     }
 
-    let (flags, addr) = unwrap_or_return_unreachable_state!(
+    let (flags, _, addr) = unwrap_or_return_unreachable_state!(
         state,
         prepare_atomic_addr(
             memarg,

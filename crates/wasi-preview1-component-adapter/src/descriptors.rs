@@ -1,5 +1,10 @@
-use crate::bindings::streams::{self, InputStream, OutputStream};
-use crate::bindings::{filesystem, tcp};
+use crate::bindings::wasi::cli::{
+    stderr, stdin, stdout, terminal_input, terminal_output, terminal_stderr, terminal_stdin,
+    terminal_stdout,
+};
+use crate::bindings::wasi::filesystem::types as filesystem;
+use crate::bindings::wasi::io::streams::{self, InputStream, OutputStream};
+use crate::bindings::wasi::sockets::tcp;
 use crate::{set_stderr_stream, BumpArena, File, ImportAlloc, TrappingUnwrap, WasmStr};
 use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
@@ -30,7 +35,7 @@ impl Drop for Descriptor {
                 match &stream.type_ {
                     StreamType::File(file) => filesystem::drop_descriptor(file.fd),
                     StreamType::Socket(_) => unreachable!(),
-                    StreamType::Stdio => {}
+                    StreamType::Stdio(_) => {}
                 }
             }
             Descriptor::Closed(_) => {}
@@ -42,10 +47,10 @@ impl Drop for Descriptor {
 /// identifies what kind of stream they are and possibly supporting
 /// type-specific operations like seeking.
 pub struct Streams {
-    /// The output stream, if present.
+    /// The input stream, if present.
     pub input: Cell<Option<InputStream>>,
 
-    /// The input stream, if present.
+    /// The output stream, if present.
     pub output: Cell<Option<OutputStream>>,
 
     /// Information about the source of the stream.
@@ -67,7 +72,7 @@ impl Streams {
                 // For files, we may have adjusted the position for seeking, so
                 // create a new stream.
                 StreamType::File(file) => {
-                    let input = filesystem::read_via_stream(file.fd, file.position.get());
+                    let input = filesystem::read_via_stream(file.fd, file.position.get())?;
                     self.input.set(Some(input));
                     Ok(input)
                 }
@@ -91,9 +96,9 @@ impl Streams {
                 // create a new stream.
                 StreamType::File(file) => {
                     let output = if file.append {
-                        filesystem::append_via_stream(file.fd)
+                        filesystem::append_via_stream(file.fd)?
                     } else {
-                        filesystem::write_via_stream(file.fd, file.position.get())
+                        filesystem::write_via_stream(file.fd, file.position.get())?
                     };
                     self.output.set(Some(output));
                     Ok(output)
@@ -107,13 +112,27 @@ impl Streams {
 #[allow(dead_code)] // until Socket is implemented
 pub enum StreamType {
     /// Stream is used for implementing stdio.
-    Stdio,
+    Stdio(IsATTY),
 
     /// Streaming data with a file.
     File(File),
 
     /// Streaming data with a socket connection.
     Socket(tcp::TcpSocket),
+}
+
+pub enum IsATTY {
+    Yes,
+    No,
+}
+
+impl IsATTY {
+    pub fn filetype(&self) -> wasi::Filetype {
+        match self {
+            IsATTY::Yes => wasi::FILETYPE_CHARACTER_DEVICE,
+            IsATTY::No => wasi::FILETYPE_UNKNOWN,
+        }
+    }
 }
 
 #[repr(C)]
@@ -140,29 +159,52 @@ impl Descriptors {
             preopens: Cell::new(None),
         };
 
-        let stdio = crate::bindings::preopens::get_stdio();
-        unsafe { set_stderr_stream(stdio.stderr) };
+        let stdin = stdin::get_stdin();
+        let stdin_isatty = match terminal_stdin::get_terminal_stdin() {
+            Some(t) => {
+                terminal_input::drop_terminal_input(t);
+                IsATTY::Yes
+            }
+            None => IsATTY::No,
+        };
+        let stdout = stdout::get_stdout();
+        let stdout_isatty = match terminal_stdout::get_terminal_stdout() {
+            Some(t) => {
+                terminal_output::drop_terminal_output(t);
+                IsATTY::Yes
+            }
+            None => IsATTY::No,
+        };
+        let stderr = stderr::get_stderr();
+        unsafe { set_stderr_stream(stderr) };
+        let stderr_isatty = match terminal_stderr::get_terminal_stderr() {
+            Some(t) => {
+                terminal_output::drop_terminal_output(t);
+                IsATTY::Yes
+            }
+            None => IsATTY::No,
+        };
 
         d.push(Descriptor::Streams(Streams {
-            input: Cell::new(Some(stdio.stdin)),
+            input: Cell::new(Some(stdin)),
             output: Cell::new(None),
-            type_: StreamType::Stdio,
+            type_: StreamType::Stdio(stdin_isatty),
         }))
         .trapping_unwrap();
         d.push(Descriptor::Streams(Streams {
             input: Cell::new(None),
-            output: Cell::new(Some(stdio.stdout)),
-            type_: StreamType::Stdio,
+            output: Cell::new(Some(stdout)),
+            type_: StreamType::Stdio(stdout_isatty),
         }))
         .trapping_unwrap();
         d.push(Descriptor::Streams(Streams {
             input: Cell::new(None),
-            output: Cell::new(Some(stdio.stderr)),
-            type_: StreamType::Stdio,
+            output: Cell::new(Some(stderr)),
+            type_: StreamType::Stdio(stderr_isatty),
         }))
         .trapping_unwrap();
 
-        #[link(wasm_import_module = "preopens")]
+        #[link(wasm_import_module = "wasi:filesystem/preopens")]
         extern "C" {
             #[link_name = "get-directories"]
             fn get_preopens_import(rval: *mut PreopenList);
@@ -187,8 +229,7 @@ impl Descriptors {
                 output: Cell::new(None),
                 type_: StreamType::File(File {
                     fd: preopen.descriptor,
-                    descriptor_type: crate::bindings::filesystem::get_type(preopen.descriptor)
-                        .trapping_unwrap(),
+                    descriptor_type: filesystem::get_type(preopen.descriptor).trapping_unwrap(),
                     position: Cell::new(0),
                     append: false,
                     blocking: false,
@@ -302,7 +343,7 @@ impl Descriptors {
     // Implementation of fd_renumber
     pub fn renumber(&mut self, from_fd: Fd, to_fd: Fd) -> Result<(), Errno> {
         // First, ensure from_fd is in bounds:
-        drop(self.get(from_fd)?);
+        let _ = self.get(from_fd)?;
         // Expand table until to_fd is in bounds as well:
         while self.table_len.get() as u32 <= to_fd as u32 {
             self.push_closed()?;
@@ -344,7 +385,7 @@ impl Descriptors {
     }
 
     #[allow(dead_code)] // until Socket is implemented
-    pub fn get_socket(&self, fd: Fd) -> Result<crate::bindings::tcp::TcpSocket, Errno> {
+    pub fn get_socket(&self, fd: Fd) -> Result<tcp::TcpSocket, Errno> {
         match self.get(fd)? {
             Descriptor::Streams(Streams {
                 type_: StreamType::Socket(socket),

@@ -69,7 +69,6 @@ unsafe fn test_stdin_read() {
 }
 
 fn writable_subs(h: &HashMap<u64, wasi::Fd>) -> Vec<wasi::Subscription> {
-    println!("writable subs: {:?}", h);
     h.iter()
         .map(|(ud, fd)| wasi::Subscription {
             userdata: *ud,
@@ -87,7 +86,7 @@ fn writable_subs(h: &HashMap<u64, wasi::Fd>) -> Vec<wasi::Subscription> {
 
 unsafe fn test_stdout_stderr_write() {
     let mut writable: HashMap<u64, wasi::Fd> =
-        vec![(1, STDOUT_FD), (2, STDERR_FD)].into_iter().collect();
+        [(1, STDOUT_FD), (2, STDERR_FD)].into_iter().collect();
 
     let clock = wasi::Subscription {
         userdata: CLOCK_ID,
@@ -103,15 +102,17 @@ unsafe fn test_stdout_stderr_write() {
             },
         },
     };
+    let mut timed_out = false;
     while !writable.is_empty() {
+        if timed_out {
+            panic!("timed out with the following pending subs: {:?}", writable)
+        }
         let mut subs = writable_subs(&writable);
         subs.push(clock.clone());
         let out = poll_oneoff_impl(&subs).unwrap();
         for event in out {
             match event.userdata {
-                CLOCK_ID => {
-                    panic!("timed out with the following pending subs: {:?}", writable)
-                }
+                CLOCK_ID => timed_out = true,
                 ud => {
                     if let Some(_) = writable.remove(&ud) {
                         assert_eq!(event.type_, wasi::EVENTTYPE_FD_WRITE);

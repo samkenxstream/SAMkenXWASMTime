@@ -2,8 +2,7 @@
 
 use crate::dominator_tree::DominatorTree;
 use crate::ir;
-use crate::ir::Function;
-
+use crate::ir::{Function, Type};
 use crate::isa::riscv64::settings as riscv_settings;
 use crate::isa::{Builder as IsaBuilder, FunctionAlignment, TargetIsa};
 use crate::machinst::{
@@ -182,6 +181,22 @@ impl TargetIsa for Riscv64Backend {
 
     fn has_native_fma(&self) -> bool {
         true
+    }
+
+    fn has_x86_blendv_lowering(&self, _: Type) -> bool {
+        false
+    }
+
+    fn has_x86_pshufb_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmulhrsw_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmaddubsw_lowering(&self) -> bool {
+        false
     }
 }
 

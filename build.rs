@@ -18,18 +18,31 @@ fn main() -> anyhow::Result<()> {
     );
     let mut out = String::new();
 
-    for strategy in &["Cranelift"] {
+    for strategy in &["Cranelift", "Winch"] {
         writeln!(out, "#[cfg(test)]")?;
         writeln!(out, "#[allow(non_snake_case)]")?;
+        if *strategy == "Winch" {
+            // We only test Winch on x86_64, for now.
+            writeln!(out, "{}", "#[cfg(all(target_arch = \"x86_64\"))]")?;
+        }
         writeln!(out, "mod {} {{", strategy)?;
 
         with_test_module(&mut out, "misc", |out| {
             test_directory(out, "tests/misc_testsuite", strategy)?;
             test_directory_module(out, "tests/misc_testsuite/multi-memory", strategy)?;
             test_directory_module(out, "tests/misc_testsuite/simd", strategy)?;
+            test_directory_module(out, "tests/misc_testsuite/tail-call", strategy)?;
             test_directory_module(out, "tests/misc_testsuite/threads", strategy)?;
             test_directory_module(out, "tests/misc_testsuite/memory64", strategy)?;
             test_directory_module(out, "tests/misc_testsuite/component-model", strategy)?;
+            test_directory_module(out, "tests/misc_testsuite/function-references", strategy)?;
+            // The testsuite of Winch is a subset of the official
+            // WebAssembly test suite, until parity is reached. This
+            // check is in place to prevent Cranelift from duplicating
+            // tests.
+            if *strategy == "Winch" {
+                test_directory_module(out, "tests/misc_testsuite/winch", strategy)?;
+            }
             Ok(())
         })?;
 
@@ -41,6 +54,11 @@ fn main() -> anyhow::Result<()> {
                 test_directory_module(out, "tests/spec_testsuite/proposals/memory64", strategy)?;
                 test_directory_module(
                     out,
+                    "tests/spec_testsuite/proposals/function-references",
+                    strategy,
+                )?;
+                test_directory_module(
+                    out,
                     "tests/spec_testsuite/proposals/multi-memory",
                     strategy,
                 )?;
@@ -50,6 +68,7 @@ fn main() -> anyhow::Result<()> {
                     "tests/spec_testsuite/proposals/relaxed-simd",
                     strategy,
                 )?;
+                test_directory_module(out, "tests/spec_testsuite/proposals/tail-call", strategy)?;
             } else {
                 println!(
                     "cargo:warning=The spec testsuite is disabled. To enable, run `git submodule \
@@ -180,72 +199,72 @@ fn write_testsuite_tests(
 
 /// Ignore tests that aren't supported yet.
 fn ignore(testsuite: &str, testname: &str, strategy: &str) -> bool {
-    assert_eq!(strategy, "Cranelift");
+    assert!(strategy == "Cranelift" || strategy == "Winch");
+
+    // Ignore everything except the winch misc test suite.
+    // We ignore tests that assert for traps on windows, given
+    // that Winch doesn't encode unwind information for Windows, yet.
+    if strategy == "Winch" {
+        if testsuite != "winch" {
+            return true;
+        }
+
+        let assert_trap = ["i32", "i64"].contains(&testname);
+
+        if assert_trap && env::var("CARGO_CFG_TARGET_OS").unwrap().as_str() == "windows" {
+            return true;
+        }
+    }
 
     // This is an empty file right now which the `wast` crate doesn't parse
     if testname.contains("memory_copy1") {
         return true;
     }
 
+    if testsuite == "function_references" {
+        // The following tests fail due to function references not yet
+        // being exposed in the public API.
+        if testname == "ref_null" || testname == "local_init" {
+            return true;
+        }
+        // This test fails due to incomplete support for the various
+        // table/elem syntactic sugar in wasm-tools/wast.
+        if testname == "br_table" {
+            return true;
+        }
+        // This test fails due to the current implementation of type
+        // canonicalisation being broken as a result of
+        // #[derive(hash)] on WasmHeapType.
+        if testname == "type_equivalence" {
+            return true;
+        }
+    }
+
     match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
         "s390x" => {
             // FIXME: These tests fail under qemu due to a qemu bug.
             testname == "simd_f32x4_pmin_pmax" || testname == "simd_f64x2_pmin_pmax"
+                // TODO(#6530): These tests require tail calls, but s390x
+                // doesn't support them yet.
+                || testsuite == "function_references" || testsuite == "tail_call"
         }
 
         "riscv64" => {
-            if testname.contains("memory_multi") || testsuite.contains("relaxed_simd") {
-                return true;
-            }
-
-            // The memory64 testsuite has a single SIMD test that we don't pass yet.
-            if testname == "simd" && testsuite == "memory64" {
+            if testsuite.contains("relaxed_simd") {
                 return true;
             }
 
             let known_failure = [
-                "almost_extmul",
                 "canonicalize_nan",
                 "cvt_from_uint",
-                "issue4807",
                 "issue_3327_bnot_lowering",
-                "load_splat_out_of_bounds",
-                "simd_align",
-                "simd_bit_shift",
-                "simd_boolean",
                 "simd_conversions",
-                "simd_f32x4",
-                "simd_f32x4_cmp",
-                "simd_f32x4_pmin_pmax",
                 "simd_f32x4_rounding",
-                "simd_f64x2",
-                "simd_f64x2_cmp",
-                "simd_f64x2_pmin_pmax",
                 "simd_f64x2_rounding",
-                "simd_i16x8_arith2",
-                "simd_i16x8_cmp",
-                "simd_i16x8_extadd_pairwise_i8x16",
-                "simd_i16x8_extmul_i8x16",
-                "simd_i16x8_q15mulr_sat_s",
-                "simd_i32x4_arith2",
-                "simd_i32x4_cmp",
-                "simd_i32x4_dot_i16x8",
-                "simd_i32x4_extadd_pairwise_i16x8",
-                "simd_i32x4_extmul_i16x8",
                 "simd_i32x4_trunc_sat_f32x4",
                 "simd_i32x4_trunc_sat_f64x2",
-                "simd_i64x2_arith2",
-                "simd_i64x2_cmp",
-                "simd_i64x2_extmul_i32x4",
-                "simd_i8x16_arith2",
-                "simd_i8x16_cmp",
-                "simd_int_to_int_extend",
-                "simd_lane",
                 "simd_load",
-                "simd_load_extend",
-                "simd_load_zero",
                 "simd_splat",
-                "v128_select",
             ]
             .contains(&testname);
 

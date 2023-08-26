@@ -62,7 +62,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Errors in `run` have to do with not enough input in `data`, which we
     // ignore here since it doesn't affect how we'd like to fuzz.
-    drop(execute_one(&data));
+    let _ = execute_one(&data);
 });
 
 fn execute_one(data: &[u8]) -> Result<()> {
@@ -81,8 +81,10 @@ fn execute_one(data: &[u8]) -> Result<()> {
     // When fuzzing Winch, explicitly override the compiler strategy, which by
     // default its arbitrary implementation unconditionally returns
     // `Cranelift`.
+    // We also explicitly disable multi-value support.
     if fuzz_winch {
         config.wasmtime.compiler_strategy = CompilerStrategy::Winch;
+        config.module_config.config.multi_value_enabled = false;
     }
 
     // Choose an engine that Wasmtime will be differentially executed against.
@@ -306,10 +308,68 @@ fn winch_supports_module(module: &[u8]) -> bool {
                         | I32RemS { .. }
                         | I64Mul { .. }
                         | I64Sub { .. }
+                        | I32Eq { .. }
+                        | I64Eq { .. }
+                        | I32Ne { .. }
+                        | I64Ne { .. }
+                        | I32LtS { .. }
+                        | I64LtS { .. }
+                        | I32LtU { .. }
+                        | I64LtU { .. }
+                        | I32LeS { .. }
+                        | I64LeS { .. }
+                        | I32LeU { .. }
+                        | I64LeU { .. }
+                        | I32GtS { .. }
+                        | I64GtS { .. }
+                        | I32GtU { .. }
+                        | I64GtU { .. }
+                        | I32GeS { .. }
+                        | I64GeS { .. }
+                        | I32GeU { .. }
+                        | I64GeU { .. }
+                        | I32Eqz { .. }
+                        | I64Eqz { .. }
+                        | I32And { .. }
+                        | I64And { .. }
+                        | I32Or { .. }
+                        | I64Or { .. }
+                        | I32Xor { .. }
+                        | I64Xor { .. }
+                        | I32Shl { .. }
+                        | I64Shl { .. }
+                        | I32ShrS { .. }
+                        | I64ShrS { .. }
+                        | I32ShrU { .. }
+                        | I64ShrU { .. }
+                        | I32Rotl { .. }
+                        | I64Rotl { .. }
+                        | I32Rotr { .. }
+                        | I64Rotr { .. }
+                        | I32Clz { .. }
+                        | I64Clz { .. }
+                        | I32Ctz { .. }
+                        | I64Ctz { .. }
+                        | I32Popcnt { .. }
+                        | I64Popcnt { .. }
                         | LocalGet { .. }
                         | LocalSet { .. }
+                        | LocalTee { .. }
+                        | GlobalGet { .. }
+                        | GlobalSet { .. }
                         | Call { .. }
-                        | End { .. } => {}
+                        | Nop { .. }
+                        | End { .. }
+                        | If { .. }
+                        | Else { .. }
+                        | Block { .. }
+                        | Loop { .. }
+                        | Br { .. }
+                        | BrIf { .. }
+                        | Unreachable { .. }
+                        | Return { .. }
+                        | F32Const { .. }
+                        | F64Const { .. } => {}
                         _ => {
                             supported = false;
                             break 'main;

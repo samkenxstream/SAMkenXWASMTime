@@ -1,22 +1,23 @@
 use crate::module::{
     FuncRefIndex, Initializer, MemoryInitialization, MemoryInitializer, MemoryPlan, Module,
-    ModuleType, TableInitializer, TablePlan,
+    ModuleType, TablePlan, TableSegment,
 };
 use crate::{
-    DataIndex, DefinedFuncIndex, ElemIndex, EntityIndex, EntityType, FuncIndex, Global,
-    GlobalIndex, GlobalInit, MemoryIndex, ModuleTypesBuilder, PrimaryMap, SignatureIndex,
-    TableIndex, TableInitialization, Tunables, TypeIndex, WasmError, WasmFuncType, WasmResult,
+    DataIndex, DefinedFuncIndex, ElemIndex, EntityIndex, EntityType, FuncIndex, GlobalIndex,
+    GlobalInit, MemoryIndex, ModuleTypesBuilder, PrimaryMap, SignatureIndex, TableIndex,
+    TableInitialValue, Tunables, TypeConvert, TypeIndex, WasmError, WasmFuncType, WasmHeapType,
+    WasmResult, WasmType,
 };
 use cranelift_entity::packed_option::ReservedValue;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use wasmparser::{
     types::Types, CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
-    FuncToValidate, FunctionBody, NameSectionReader, Naming, Operator, Parser, Payload, Type,
-    TypeRef, Validator, ValidatorResources,
+    FuncToValidate, FunctionBody, NameSectionReader, Naming, Operator, Parser, Payload,
+    StructuralType, TypeRef, Validator, ValidatorResources,
 };
 
 /// Object containing the standalone environment information.
@@ -150,8 +151,8 @@ pub struct WasmFileInfo {
 #[derive(Debug)]
 #[allow(missing_docs)]
 pub struct FunctionMetadata {
-    pub params: Box<[wasmparser::ValType]>,
-    pub locals: Box<[(u32, wasmparser::ValType)]>,
+    pub params: Box<[WasmType]>,
+    pub locals: Box<[(u32, WasmType)]>,
 }
 
 impl<'a, 'data> ModuleEnvironment<'a, 'data> {
@@ -237,9 +238,17 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 self.types.reserve_wasm_signatures(num);
 
                 for ty in types {
-                    match ty? {
-                        Type::Func(wasm_func_ty) => {
-                            self.declare_type_func(wasm_func_ty.try_into()?)?;
+                    let ty = ty?;
+                    if ty.is_final || ty.supertype_idx.is_some() {
+                        unimplemented!("gc proposal")
+                    }
+                    match ty.structural_type {
+                        StructuralType::Func(wasm_func_ty) => {
+                            let ty = self.convert_func_type(&wasm_func_ty);
+                            self.declare_type_func(ty)?;
+                        }
+                        StructuralType::Array(_) | StructuralType::Struct(_) => {
+                            unimplemented!("gc proposal")
                         }
                     }
                 }
@@ -267,11 +276,11 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                         }
                         TypeRef::Global(ty) => {
                             self.result.module.num_imported_globals += 1;
-                            EntityType::Global(Global::new(ty)?)
+                            EntityType::Global(self.convert_global_type(&ty))
                         }
                         TypeRef::Table(ty) => {
                             self.result.module.num_imported_tables += 1;
-                            EntityType::Table(ty.try_into()?)
+                            EntityType::Table(self.convert_table_type(&ty))
                         }
 
                         // doesn't get past validation
@@ -301,9 +310,39 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 self.result.module.table_plans.reserve_exact(cnt);
 
                 for entry in tables {
-                    let table = entry?.ty.try_into()?;
+                    let wasmparser::Table { ty, init } = entry?;
+                    let table = self.convert_table_type(&ty);
                     let plan = TablePlan::for_table(table, &self.tunables);
                     self.result.module.table_plans.push(plan);
+                    let init = match init {
+                        wasmparser::TableInit::RefNull => TableInitialValue::Null {
+                            precomputed: Vec::new(),
+                        },
+                        wasmparser::TableInit::Expr(cexpr) => {
+                            let mut init_expr_reader = cexpr.get_binary_reader();
+                            match init_expr_reader.read_operator()? {
+                                Operator::RefNull { hty: _ } => TableInitialValue::Null {
+                                    precomputed: Vec::new(),
+                                },
+                                Operator::RefFunc { function_index } => {
+                                    let index = FuncIndex::from_u32(function_index);
+                                    self.flag_func_escaped(index);
+                                    TableInitialValue::FuncRef(index)
+                                }
+                                s => {
+                                    return Err(WasmError::Unsupported(format!(
+                                        "unsupported init expr in table section: {:?}",
+                                        s
+                                    )));
+                                }
+                            }
+                        }
+                    };
+                    self.result
+                        .module
+                        .table_initialization
+                        .initial_values
+                        .push(init);
                 }
             }
 
@@ -361,7 +400,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                             )));
                         }
                     };
-                    let ty = Global::new(ty)?;
+                    let ty = self.convert_global_type(&ty);
                     self.result.module.globals.push(ty);
                     self.result.module.global_initializers.push(initializer);
                 }
@@ -411,7 +450,6 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     let wasmparser::Element {
                         kind,
                         items,
-                        ty: _,
                         range: _,
                     } = entry?;
 
@@ -430,7 +468,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                                 elements.push(func);
                             }
                         }
-                        ElementItems::Expressions(funcs) => {
+                        ElementItems::Expressions(_ty, funcs) => {
                             elements.reserve(usize::try_from(funcs.count()).unwrap());
                             for func in funcs {
                                 let func = match func?.get_binary_reader().read_operator()? {
@@ -472,17 +510,16 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                                 }
                             };
 
-                            let table_segments = match &mut self.result.module.table_initialization
-                            {
-                                TableInitialization::Segments { segments } => segments,
-                                TableInitialization::FuncTable { .. } => unreachable!(),
-                            };
-                            table_segments.push(TableInitializer {
-                                table_index,
-                                base,
-                                offset,
-                                elements: elements.into(),
-                            });
+                            self.result
+                                .module
+                                .table_initialization
+                                .segments
+                                .push(TableSegment {
+                                    table_index,
+                                    base,
+                                    offset,
+                                    elements: elements.into(),
+                                });
                         }
 
                         ElementKind::Passive => {
@@ -518,7 +555,9 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     let sig = &self.types[sig_index];
                     let mut locals = Vec::new();
                     for pair in body.get_locals_reader()? {
-                        locals.push(pair?);
+                        let (cnt, ty) = pair?;
+                        let ty = self.convert_valtype(ty);
+                        locals.push((cnt, ty));
                     }
                     self.result
                         .debuginfo
@@ -526,7 +565,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                         .funcs
                         .push(FunctionMetadata {
                             locals: locals.into_boxed_slice(),
-                            params: sig.params().iter().cloned().map(|i| i.into()).collect(),
+                            params: sig.params().into(),
                         });
                 }
                 body.allow_memarg64(self.validator.features().memory64);
@@ -838,5 +877,11 @@ and for re-adding support for interface types you can see this issue:
             }
         }
         Ok(())
+    }
+}
+
+impl TypeConvert for ModuleEnvironment<'_, '_> {
+    fn lookup_heap_type(&self, index: TypeIndex) -> WasmHeapType {
+        self.result.module.lookup_heap_type(index)
     }
 }

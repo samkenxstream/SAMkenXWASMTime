@@ -1,7 +1,7 @@
 (component
   (type string)
   (type (func (param "a" string)))
-  (type $r (record (field "x" (record)) (field "y" string)))
+  (type $r (record (field "x" (result)) (field "y" string)))
   (type $u (union $r string))
   (type $e (result $u (error u32)))
   (type (result $u))
@@ -244,6 +244,7 @@
     (type $t99 (list $t98))
     (type $t100 (list $t99))
     (type $t101 (list $t100))
+    (export "t" (type $t101))
   )
   "type nesting is too deep")
 

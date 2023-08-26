@@ -1134,6 +1134,13 @@
 (rule (lower (has_type (vr128_ty ty) (bitselect x y z)))
       (vec_select ty y z x))
 
+;; Special-case some float-selection instructions for min/max
+(rule 3 (lower (has_type (ty_vec128 ty) (bitselect (bitcast _ (fcmp (FloatCC.LessThan) x y)) x y)))
+        (fmin_pseudo_reg ty y x))
+(rule 4 (lower (has_type (ty_vec128 ty) (bitselect (bitcast _ (fcmp (FloatCC.LessThan) y x)) x y)))
+        (fmax_pseudo_reg ty y x))
+
+
 
 ;;;; Rules for `bmask` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1389,20 +1396,6 @@
       (fmax_reg ty x y))
 
 
-;;;; Rules for `fmin_pseudo` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Minimum of two registers.
-(rule (lower (has_type ty (fmin_pseudo x y)))
-      (fmin_pseudo_reg ty x y))
-
-
-;;;; Rules for `fmax_pseudo` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Maximum of two registers.
-(rule (lower (has_type ty (fmax_pseudo x y)))
-      (fmax_pseudo_reg ty x y))
-
-
 ;;;; Rules for `fcopysign` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Copysign of two registers.
@@ -1582,14 +1575,6 @@
 ;; Convert $I64X2 to $F64X2.
 (rule (lower (has_type $F64X2 (fcvt_from_sint x @ (value_type $I64X2))))
       (fcvt_from_sint_reg $F64X2 (FpuRoundMode.ToNearestTiesToEven) x))
-
-
-;;;; Rules for `fcvt_low_from_sint` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Convert the low half of a $I32X4 to a $F64X2.
-(rule (lower (has_type $F64X2 (fcvt_low_from_sint x @ (value_type $I32X4))))
-      (fcvt_from_sint_reg $F64X2 (FpuRoundMode.ToNearestTiesToEven)
-                          (vec_unpacks_low_lane_order $I32X4 x)))
 
 
 ;;;; Rules for `fcvt_to_uint` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3727,6 +3712,12 @@
       (select_bool_reg ty (value_nonzero val_cond)
                        (put_in_reg val_true) (put_in_reg val_false)))
 
+;; Special-case some float-selection instructions for min/max
+(rule 1 (lower (has_type (ty_scalar_float ty) (select (maybe_uextend (fcmp (FloatCC.LessThan) x y)) x y)))
+        (fmin_pseudo_reg ty y x))
+(rule 2 (lower (has_type (ty_scalar_float ty) (select (maybe_uextend (fcmp (FloatCC.LessThan) y x)) x y)))
+        (fmax_pseudo_reg ty y x))
+
 
 ;;;; Rules for `select_spectre_guard` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -3897,7 +3888,7 @@
 ;;;; Rules for `return` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (return args))
-      (lower_return (range 0 (value_slice_len args)) args))
+      (lower_return args))
 
 
 ;;;; Rules for `call` and `call_indirect` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

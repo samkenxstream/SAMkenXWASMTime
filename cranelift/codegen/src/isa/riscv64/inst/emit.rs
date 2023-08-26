@@ -1,11 +1,10 @@
 //! Riscv64 ISA: binary code emission.
 
 use crate::binemit::StackMap;
-use crate::ir::RelSourceLoc;
-use crate::ir::TrapCode;
+use crate::ir::{self, RelSourceLoc, TrapCode};
 use crate::isa::riscv64::inst::*;
-use crate::isa::riscv64::inst::{zero_reg, AluOPRRR};
 use crate::machinst::{AllocationConsumer, Reg, Writable};
+use crate::trace;
 use cranelift_control::ControlPlane;
 use regalloc2::Allocation;
 
@@ -422,9 +421,11 @@ impl Inst {
             | Inst::Args { .. }
             | Inst::Ret { .. }
             | Inst::Extend { .. }
-            | Inst::AjustSp { .. }
+            | Inst::AdjustSp { .. }
             | Inst::Call { .. }
             | Inst::CallInd { .. }
+            | Inst::ReturnCall { .. }
+            | Inst::ReturnCallInd { .. }
             | Inst::TrapIf { .. }
             | Inst::Jal { .. }
             | Inst::CondBr { .. }
@@ -457,19 +458,24 @@ impl Inst {
             | Inst::DummyUse { .. }
             | Inst::FloatRound { .. }
             | Inst::FloatSelect { .. }
-            | Inst::FloatSelectPseudo { .. }
             | Inst::Popcnt { .. }
             | Inst::Rev8 { .. }
             | Inst::Cltz { .. }
             | Inst::Brev8 { .. }
             | Inst::StackProbeLoop { .. } => None,
+
             // VecSetState does not expect any vstate, rather it updates it.
             Inst::VecSetState { .. } => None,
 
+            // `vmv` instructions copy a set of registers and ignore vstate.
+            Inst::VecAluRRImm5 { op: VecAluOpRRImm5::VmvrV, .. } => None,
+
             Inst::VecAluRR { vstate, .. } |
             Inst::VecAluRRR { vstate, .. } |
+            Inst::VecAluRRRR { vstate, .. } |
             Inst::VecAluRImm5 { vstate, .. } |
             Inst::VecAluRRImm5 { vstate, .. } |
+            Inst::VecAluRRRImm5 { vstate, .. } |
             // TODO: Unit-stride loads and stores only need the AVL to be correct, not
             // the full vtype. A future optimization could be to decouple these two when
             // updating vstate. This would allow us to avoid emitting a VecSetState in
@@ -722,7 +728,15 @@ impl MachInstEmit for Inst {
                 // Nothing: this is a pseudoinstruction that serves
                 // only to constrain registers at a certain point.
             }
-            &Inst::Ret { .. } => {
+            &Inst::Ret {
+                stack_bytes_to_pop, ..
+            } => {
+                if stack_bytes_to_pop != 0 {
+                    Inst::AdjustSp {
+                        amount: i64::from(stack_bytes_to_pop),
+                    }
+                    .emit(&[], sink, emit_info, state);
+                }
                 //jalr x0, x1, 0
                 let x: u32 = (0b1100111) | (1 << 15);
                 sink.put4(x);
@@ -770,7 +784,7 @@ impl MachInstEmit for Inst {
                     .into_iter()
                     .for_each(|i| i.emit(&[], sink, emit_info, state));
             }
-            &Inst::AjustSp { amount } => {
+            &Inst::AdjustSp { amount } => {
                 if let Some(imm) = Imm12::maybe_from_u64(amount as u64) {
                     Inst::AluRRImm12 {
                         alu_op: AluOPRRI::Addi,
@@ -839,6 +853,13 @@ impl MachInstEmit for Inst {
                         .emit(&[], sink, emit_info, state);
                     }
                 }
+
+                let callee_pop_size = i64::from(info.callee_pop_size);
+                state.virtual_sp_offset -= callee_pop_size;
+                trace!(
+                    "call adjusts virtual sp offset by {callee_pop_size} -> {}",
+                    state.virtual_sp_offset
+                );
             }
             &Inst::CallInd { ref info } => {
                 let rn = allocs.next(info.rn);
@@ -855,6 +876,65 @@ impl MachInstEmit for Inst {
                     offset: Imm12::zero(),
                 }
                 .emit(&[], sink, emit_info, state);
+
+                let callee_pop_size = i64::from(info.callee_pop_size);
+                state.virtual_sp_offset -= callee_pop_size;
+                trace!(
+                    "call adjusts virtual sp offset by {callee_pop_size} -> {}",
+                    state.virtual_sp_offset
+                );
+            }
+
+            &Inst::ReturnCall {
+                ref callee,
+                ref info,
+            } => {
+                emit_return_call_common_sequence(
+                    &mut allocs,
+                    sink,
+                    emit_info,
+                    state,
+                    info.new_stack_arg_size,
+                    info.old_stack_arg_size,
+                    &info.uses,
+                );
+
+                sink.add_call_site(ir::Opcode::ReturnCall);
+                sink.add_reloc(Reloc::RiscvCall, &callee, 0);
+                Inst::construct_auipc_and_jalr(None, writable_spilltmp_reg(), 0)
+                    .into_iter()
+                    .for_each(|i| i.emit(&[], sink, emit_info, state));
+
+                // `emit_return_call_common_sequence` emits an island if
+                // necessary, so we can safely disable the worst-case-size check
+                // in this case.
+                start_off = sink.cur_offset();
+            }
+
+            &Inst::ReturnCallInd { callee, ref info } => {
+                let callee = allocs.next(callee);
+
+                emit_return_call_common_sequence(
+                    &mut allocs,
+                    sink,
+                    emit_info,
+                    state,
+                    info.new_stack_arg_size,
+                    info.old_stack_arg_size,
+                    &info.uses,
+                );
+
+                Inst::Jalr {
+                    rd: writable_zero_reg(),
+                    base: callee,
+                    offset: Imm12::zero(),
+                }
+                .emit(&[], sink, emit_info, state);
+
+                // `emit_return_call_common_sequence` emits an island if
+                // necessary, so we can safely disable the worst-case-size check
+                // in this case.
+                start_off = sink.cur_offset();
             }
 
             &Inst::Jal { dest } => {
@@ -928,34 +1008,44 @@ impl MachInstEmit for Inst {
             }
 
             &Inst::Mov { rd, rm, ty } => {
-                debug_assert_ne!(rd.to_reg().class(), RegClass::Vector);
-                debug_assert_ne!(rm.class(), RegClass::Vector);
-                if rd.to_reg() != rm {
-                    let rm = allocs.next(rm);
-                    let rd = allocs.next_writable(rd);
-                    if ty.is_float() {
-                        Inst::FpuRRR {
-                            alu_op: if ty == F32 {
-                                FpuOPRRR::FsgnjS
-                            } else {
-                                FpuOPRRR::FsgnjD
-                            },
-                            frm: None,
-                            rd: rd,
-                            rs1: rm,
-                            rs2: rm,
-                        }
-                        .emit(&[], sink, emit_info, state);
-                    } else {
-                        let x = Inst::AluRRImm12 {
-                            alu_op: AluOPRRI::Ori,
-                            rd: rd,
-                            rs: rm,
-                            imm12: Imm12::zero(),
-                        };
-                        x.emit(&[], sink, emit_info, state);
-                    }
+                debug_assert_eq!(rd.to_reg().class(), rm.class());
+                if rd.to_reg() == rm {
+                    return;
                 }
+
+                let rm = allocs.next(rm);
+                let rd = allocs.next_writable(rd);
+
+                match rm.class() {
+                    RegClass::Int => Inst::AluRRImm12 {
+                        alu_op: AluOPRRI::Ori,
+                        rd: rd,
+                        rs: rm,
+                        imm12: Imm12::zero(),
+                    },
+                    RegClass::Float => Inst::FpuRRR {
+                        alu_op: if ty == F32 {
+                            FpuOPRRR::FsgnjS
+                        } else {
+                            FpuOPRRR::FsgnjD
+                        },
+                        frm: None,
+                        rd: rd,
+                        rs1: rm,
+                        rs2: rm,
+                    },
+                    RegClass::Vector => Inst::VecAluRRImm5 {
+                        op: VecAluOpRRImm5::VmvrV,
+                        vd: rd,
+                        vs2: rm,
+                        // Imm 0 means copy 1 register.
+                        imm: Imm5::maybe_from_i8(0).unwrap(),
+                        mask: VecOpMasking::Disabled,
+                        // Vstate for this instruction is ignored.
+                        vstate: VState::from_type(ty),
+                    },
+                }
+                .emit(&[], sink, emit_info, state);
             }
 
             &Inst::MovFromPReg { rd, rm } => {
@@ -1121,7 +1211,7 @@ impl MachInstEmit for Inst {
             }
 
             &Inst::VirtualSPOffsetAdj { amount } => {
-                log::trace!(
+                crate::trace!(
                     "virtual sp offset adjusted by {} -> {}",
                     amount,
                     state.virtual_sp_offset + amount
@@ -1697,11 +1787,13 @@ impl MachInstEmit for Inst {
                 let rd = allocs.next_writable(rd);
                 let label_true = sink.get_label();
                 let label_jump_over = sink.get_label();
+                let ty = Inst::canonical_type_for_rc(rs1.class());
+
                 sink.use_label_at_offset(sink.cur_offset(), label_true, LabelUse::B12);
                 let x = condition.emit();
                 sink.put4(x);
                 // here is false , use rs2
-                Inst::gen_move(rd, rs2, I64).emit(&[], sink, emit_info, state);
+                Inst::gen_move(rd, rs2, ty).emit(&[], sink, emit_info, state);
                 // and jump over
                 Inst::Jal {
                     dest: BranchTarget::Label(label_jump_over),
@@ -1709,7 +1801,7 @@ impl MachInstEmit for Inst {
                 .emit(&[], sink, emit_info, state);
                 // here condition is true , use rs1
                 sink.bind_label(label_true, &mut state.ctrl_plane);
-                Inst::gen_move(rd, rs1, I64).emit(&[], sink, emit_info, state);
+                Inst::gen_move(rd, rs1, ty).emit(&[], sink, emit_info, state);
                 sink.bind_label(label_jump_over, &mut state.ctrl_plane);
             }
             &Inst::FcvtToInt {
@@ -1936,10 +2028,7 @@ impl MachInstEmit for Inst {
                 .emit(&[], sink, emit_info, state);
                 // trap
                 sink.bind_label(label_trap, &mut state.ctrl_plane);
-                Inst::Udf {
-                    trap_code: trap_code,
-                }
-                .emit(&[], sink, emit_info, state);
+                Inst::Udf { trap_code }.emit(&[], sink, emit_info, state);
                 sink.bind_label(label_jump_over, &mut state.ctrl_plane);
             }
             &Inst::TrapIf { test, trap_code } => {
@@ -2150,53 +2239,6 @@ impl MachInstEmit for Inst {
                 // here select origin x.
                 sink.bind_label(label_x, &mut state.ctrl_plane);
                 Inst::gen_move(rd, rs, ty).emit(&[], sink, emit_info, state);
-                sink.bind_label(label_jump_over, &mut state.ctrl_plane);
-            }
-            &Inst::FloatSelectPseudo {
-                op,
-                rd,
-                tmp,
-                rs1,
-                rs2,
-                ty,
-            } => {
-                let rs1 = allocs.next(rs1);
-                let rs2 = allocs.next(rs2);
-                let tmp = allocs.next_writable(tmp);
-                let rd = allocs.next_writable(rd);
-                let label_rs2 = sink.get_label();
-                let label_jump_over = sink.get_label();
-                let lt_op = if ty == F32 {
-                    FpuOPRRR::FltS
-                } else {
-                    FpuOPRRR::FltD
-                };
-                Inst::FpuRRR {
-                    alu_op: lt_op,
-                    frm: None,
-                    rd: tmp,
-                    rs1: if op == FloatSelectOP::Max { rs1 } else { rs2 },
-                    rs2: if op == FloatSelectOP::Max { rs2 } else { rs1 },
-                }
-                .emit(&[], sink, emit_info, state);
-                Inst::CondBr {
-                    taken: BranchTarget::Label(label_rs2),
-                    not_taken: BranchTarget::zero(),
-                    kind: IntegerCompare {
-                        kind: IntCC::NotEqual,
-                        rs1: tmp.to_reg(),
-                        rs2: zero_reg(),
-                    },
-                }
-                .emit(&[], sink, emit_info, state);
-                // here select rs1 as result.
-                Inst::gen_move(rd, rs1, ty).emit(&[], sink, emit_info, state);
-                Inst::Jal {
-                    dest: BranchTarget::Label(label_jump_over),
-                }
-                .emit(&[], sink, emit_info, state);
-                sink.bind_label(label_rs2, &mut state.ctrl_plane);
-                Inst::gen_move(rd, rs2, ty).emit(&[], sink, emit_info, state);
                 sink.bind_label(label_jump_over, &mut state.ctrl_plane);
             }
 
@@ -2802,6 +2844,43 @@ impl MachInstEmit for Inst {
                 .emit(&[], sink, emit_info, state);
                 sink.bind_label(label_done, &mut state.ctrl_plane);
             }
+            &Inst::VecAluRRRImm5 {
+                op,
+                vd,
+                vd_src,
+                imm,
+                vs2,
+                ref mask,
+                ..
+            } => {
+                let vs2 = allocs.next(vs2);
+                let vd_src = allocs.next(vd_src);
+                let vd = allocs.next_writable(vd);
+                let mask = mask.with_allocs(&mut allocs);
+
+                debug_assert_eq!(vd.to_reg(), vd_src);
+
+                sink.put4(encode_valu_rrr_imm(op, vd, imm, vs2, mask));
+            }
+            &Inst::VecAluRRRR {
+                op,
+                vd,
+                vd_src,
+                vs1,
+                vs2,
+                ref mask,
+                ..
+            } => {
+                let vs1 = allocs.next(vs1);
+                let vs2 = allocs.next(vs2);
+                let vd_src = allocs.next(vd_src);
+                let vd = allocs.next_writable(vd);
+                let mask = mask.with_allocs(&mut allocs);
+
+                debug_assert_eq!(vd.to_reg(), vd_src);
+
+                sink.put4(encode_valu_rrrr(op, vd, vs2, vs1, mask));
+            }
             &Inst::VecAluRRR {
                 op,
                 vd,
@@ -2829,7 +2908,7 @@ impl MachInstEmit for Inst {
                 let vd = allocs.next_writable(vd);
                 let mask = mask.with_allocs(&mut allocs);
 
-                sink.put4(encode_valu_imm(op, vd, imm, vs2, mask));
+                sink.put4(encode_valu_rr_imm(op, vd, imm, vs2, mask));
             }
             &Inst::VecAluRR {
                 op,
@@ -2997,4 +3076,151 @@ fn alloc_value_regs(orgin: &ValueRegs<Reg>, alloc: &mut AllocationConsumer) -> V
         2 => ValueRegs::two(alloc.next(orgin.regs()[0]), alloc.next(orgin.regs()[1])),
         _ => unreachable!(),
     }
+}
+
+fn emit_return_call_common_sequence(
+    allocs: &mut AllocationConsumer<'_>,
+    sink: &mut MachBuffer<Inst>,
+    emit_info: &EmitInfo,
+    state: &mut EmitState,
+    new_stack_arg_size: u32,
+    old_stack_arg_size: u32,
+    uses: &CallArgList,
+) {
+    for u in uses {
+        let _ = allocs.next(u.vreg);
+    }
+
+    // We are emitting a dynamic number of instructions and might need an
+    // island. We emit four instructions regardless of how many stack arguments
+    // we have, up to two instructions for the actual call, and then two
+    // instructions per word of stack argument space.
+    let new_stack_words = new_stack_arg_size / 8;
+    let insts = 4 + 2 + 2 * new_stack_words;
+    let space_needed = insts * u32::try_from(Inst::INSTRUCTION_SIZE).unwrap();
+    if sink.island_needed(space_needed) {
+        let jump_around_label = sink.get_label();
+        Inst::Jal {
+            dest: BranchTarget::Label(jump_around_label),
+        }
+        .emit(&[], sink, emit_info, state);
+        sink.emit_island(space_needed + 4, &mut state.ctrl_plane);
+        sink.bind_label(jump_around_label, &mut state.ctrl_plane);
+    }
+
+    // Copy the new frame on top of our current frame.
+    //
+    // The current stack layout is the following:
+    //
+    //            | ...                 |
+    //            +---------------------+
+    //            | ...                 |
+    //            | stack arguments     |
+    //            | ...                 |
+    //    current | return address      |
+    //    frame   | old FP              | <-- FP
+    //            | ...                 |
+    //            | old stack slots     |
+    //            | ...                 |
+    //            +---------------------+
+    //            | ...                 |
+    //    new     | new stack arguments |
+    //    frame   | ...                 | <-- SP
+    //            +---------------------+
+    //
+    // We need to restore the old FP, restore the return address from the stack
+    // to the link register, copy the new stack arguments over the old stack
+    // arguments, adjust SP to point to the new stack arguments, and then jump
+    // to the callee (which will push the old FP and RA again). Note that the
+    // actual jump happens outside this helper function.
+
+    assert_eq!(
+        new_stack_arg_size % 8,
+        0,
+        "size of new stack arguments must be 8-byte aligned"
+    );
+
+    // The delta from our frame pointer to the (eventual) stack pointer value
+    // when we jump to the tail callee. This is the difference in size of stack
+    // arguments as well as accounting for the two words we pushed onto the
+    // stack upon entry to this function (the return address and old frame
+    // pointer).
+    let fp_to_callee_sp = i64::from(old_stack_arg_size) - i64::from(new_stack_arg_size) + 16;
+
+    let tmp1 = regs::writable_spilltmp_reg();
+    let tmp2 = regs::writable_spilltmp_reg2();
+
+    // Restore the return address to the link register, and load the old FP into
+    // a temporary register.
+    //
+    // We can't put the old FP into the FP register until after we copy the
+    // stack arguments into place, since that uses address modes that are
+    // relative to our current FP.
+    //
+    // Note that the FP is saved in the function prologue for all non-leaf
+    // functions, even when `preserve_frame_pointers=false`. Note also that
+    // `return_call` instructions make it so that a function is considered
+    // non-leaf. Therefore we always have an FP to restore here.
+
+    Inst::gen_load(
+        writable_link_reg(),
+        AMode::FPOffset(8, I64),
+        I64,
+        MemFlags::trusted(),
+    )
+    .emit(&[], sink, emit_info, state);
+    Inst::gen_load(tmp1, AMode::FPOffset(0, I64), I64, MemFlags::trusted()).emit(
+        &[],
+        sink,
+        emit_info,
+        state,
+    );
+
+    // Copy the new stack arguments over the old stack arguments.
+    for i in (0..new_stack_words).rev() {
+        // Load the `i`th new stack argument word from the temporary stack
+        // space.
+        Inst::gen_load(
+            tmp2,
+            AMode::SPOffset(i64::from(i * 8), types::I64),
+            types::I64,
+            ir::MemFlags::trusted(),
+        )
+        .emit(&[], sink, emit_info, state);
+
+        // Store it to its final destination on the stack, overwriting our
+        // current frame.
+        Inst::gen_store(
+            AMode::FPOffset(fp_to_callee_sp + i64::from(i * 8), types::I64),
+            tmp2.to_reg(),
+            types::I64,
+            ir::MemFlags::trusted(),
+        )
+        .emit(&[], sink, emit_info, state);
+    }
+
+    // Initialize the SP for the tail callee, deallocating the temporary stack
+    // argument space and our current frame at the same time.
+    Inst::AluRRImm12 {
+        alu_op: AluOPRRI::Addi,
+        rd: regs::writable_stack_reg(),
+        rs: regs::fp_reg(),
+        imm12: Imm12::maybe_from_u64(fp_to_callee_sp as u64).unwrap(),
+    }
+    .emit(&[], sink, emit_info, state);
+
+    // Move the old FP value from the temporary into the FP register.
+    Inst::Mov {
+        ty: types::I64,
+        rd: regs::writable_fp_reg(),
+        rm: tmp1.to_reg(),
+    }
+    .emit(&[], sink, emit_info, state);
+
+    state.virtual_sp_offset -= i64::from(new_stack_arg_size);
+    trace!(
+        "return_call[_ind] adjusts virtual sp offset by {} -> {}",
+        new_stack_arg_size,
+        state.virtual_sp_offset
+    );
 }

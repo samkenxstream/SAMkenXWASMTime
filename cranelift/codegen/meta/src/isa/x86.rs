@@ -1,15 +1,7 @@
 use crate::cdsl::isa::TargetIsa;
-use crate::cdsl::settings::{PredicateNode, SettingGroup, SettingGroupBuilder};
+use crate::cdsl::settings::{PredicateNode, SettingGroupBuilder};
 
-use crate::shared::Definitions as SharedDefinitions;
-
-pub(crate) fn define(shared_defs: &mut SharedDefinitions) -> TargetIsa {
-    let settings = define_settings(&shared_defs.settings);
-
-    TargetIsa::new("x86", settings)
-}
-
-fn define_settings(shared: &SettingGroup) -> SettingGroup {
+pub(crate) fn define() -> TargetIsa {
     let mut settings = SettingGroupBuilder::new("x86");
 
     // CPUID.01H:ECX
@@ -17,22 +9,19 @@ fn define_settings(shared: &SettingGroup) -> SettingGroup {
         "has_sse3",
         "Has support for SSE3.",
         "SSE3: CPUID.01H:ECX.SSE3[bit 0]",
-        // Needed for default `enable_simd` setting.
-        true,
+        false,
     );
     let has_ssse3 = settings.add_bool(
         "has_ssse3",
         "Has support for SSSE3.",
         "SSSE3: CPUID.01H:ECX.SSSE3[bit 9]",
-        // Needed for default `enable_simd` setting.
-        true,
+        false,
     );
     let has_sse41 = settings.add_bool(
         "has_sse41",
         "Has support for SSE4.1.",
         "SSE4.1: CPUID.01H:ECX.SSE4_1[bit 19]",
-        // Needed for default `enable_simd` setting.
-        true,
+        false,
     );
     let has_sse42 = settings.add_bool(
         "has_sse42",
@@ -117,51 +106,18 @@ fn define_settings(shared: &SettingGroup) -> SettingGroup {
         false,
     );
 
-    let shared_enable_simd = shared.get_bool("enable_simd");
-
     settings.add_predicate("use_ssse3", predicate!(has_ssse3));
     settings.add_predicate("use_sse41", predicate!(has_sse41));
     settings.add_predicate("use_sse42", predicate!(has_sse41 && has_sse42));
     settings.add_predicate("use_fma", predicate!(has_avx && has_fma));
 
-    settings.add_predicate(
-        "use_ssse3_simd",
-        predicate!(shared_enable_simd && has_ssse3),
-    );
-    settings.add_predicate(
-        "use_sse41_simd",
-        predicate!(shared_enable_simd && has_sse41),
-    );
-    settings.add_predicate(
-        "use_sse42_simd",
-        predicate!(shared_enable_simd && has_sse41 && has_sse42),
-    );
-
-    settings.add_predicate("use_avx_simd", predicate!(shared_enable_simd && has_avx));
-    settings.add_predicate(
-        "use_avx2_simd",
-        predicate!(shared_enable_simd && has_avx && has_avx2),
-    );
-    settings.add_predicate(
-        "use_avx512bitalg_simd",
-        predicate!(shared_enable_simd && has_avx512bitalg),
-    );
-    settings.add_predicate(
-        "use_avx512dq_simd",
-        predicate!(shared_enable_simd && has_avx512dq),
-    );
-    settings.add_predicate(
-        "use_avx512vl_simd",
-        predicate!(shared_enable_simd && has_avx512vl),
-    );
-    settings.add_predicate(
-        "use_avx512vbmi_simd",
-        predicate!(shared_enable_simd && has_avx512vbmi),
-    );
-    settings.add_predicate(
-        "use_avx512f_simd",
-        predicate!(shared_enable_simd && has_avx512f),
-    );
+    settings.add_predicate("use_avx", predicate!(has_avx));
+    settings.add_predicate("use_avx2", predicate!(has_avx && has_avx2));
+    settings.add_predicate("use_avx512bitalg", predicate!(has_avx512bitalg));
+    settings.add_predicate("use_avx512dq", predicate!(has_avx512dq));
+    settings.add_predicate("use_avx512vl", predicate!(has_avx512vl));
+    settings.add_predicate("use_avx512vbmi", predicate!(has_avx512vbmi));
+    settings.add_predicate("use_avx512f", predicate!(has_avx512f));
 
     settings.add_predicate("use_popcnt", predicate!(has_popcnt && has_sse42));
     settings.add_predicate("use_bmi1", predicate!(has_bmi1));
@@ -441,5 +397,5 @@ fn define_settings(shared: &SettingGroup) -> SettingGroup {
         preset!(x86_64_v3 && has_avx512dq && has_avx512vl),
     );
 
-    settings.build()
+    TargetIsa::new("x86", settings.build())
 }

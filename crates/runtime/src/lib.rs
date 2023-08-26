@@ -20,7 +20,7 @@
     )
 )]
 
-use anyhow::Error;
+use anyhow::{Error, Result};
 use std::fmt;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -55,8 +55,8 @@ pub use crate::export::*;
 pub use crate::externref::*;
 pub use crate::imports::Imports;
 pub use crate::instance::{
-    Instance, InstanceAllocationRequest, InstanceAllocator, InstanceHandle,
-    OnDemandInstanceAllocator, StorePtr,
+    Instance, InstanceAllocationRequest, InstanceAllocator, InstanceAllocatorImpl, InstanceHandle,
+    MemoryAllocationIndex, OnDemandInstanceAllocator, StorePtr, TableAllocationIndex,
 };
 #[cfg(feature = "pooling-allocator")]
 pub use crate::instance::{
@@ -69,10 +69,7 @@ pub use crate::mmap::Mmap;
 pub use crate::mmap_vec::MmapVec;
 pub use crate::store_box::*;
 pub use crate::table::{Table, TableElement};
-pub use crate::traphandlers::{
-    catch_traps, init_traps, raise_lib_trap, raise_user_trap, resume_panic, tls_eager_initialize,
-    Backtrace, Frame, SignalHandler, TlsRestore, Trap, TrapReason,
-};
+pub use crate::traphandlers::*;
 pub use crate::vmcontext::{
     VMArrayCallFunction, VMArrayCallHostFuncContext, VMContext, VMFuncRef, VMFunctionBody,
     VMFunctionImport, VMGlobalDefinition, VMGlobalImport, VMInvokeArgument, VMMemoryDefinition,
@@ -135,7 +132,9 @@ pub unsafe trait Store {
     ) -> Result<bool, Error>;
     /// Callback invoked to notify the store's resource limiter that a memory
     /// grow operation has failed.
-    fn memory_grow_failed(&mut self, error: &Error);
+    ///
+    /// Note that this is not invoked if `memory_growing` returns an error.
+    fn memory_grow_failed(&mut self, error: Error) -> Result<()>;
     /// Callback invoked to allow the store's resource limiter to reject a
     /// table grow operation.
     fn table_growing(
@@ -146,7 +145,9 @@ pub unsafe trait Store {
     ) -> Result<bool, Error>;
     /// Callback invoked to notify the store's resource limiter that a table
     /// grow operation has failed.
-    fn table_grow_failed(&mut self, error: &Error);
+    ///
+    /// Note that this is not invoked if `table_growing` returns an error.
+    fn table_grow_failed(&mut self, error: Error) -> Result<()>;
     /// Callback invoked whenever fuel runs out by a wasm instance. If an error
     /// is returned that's raised as a trap. Otherwise wasm execution will
     /// continue as normal.
@@ -155,6 +156,10 @@ pub unsafe trait Store {
     /// number. Cannot fail; cooperative epoch-based yielding is
     /// completely semantically transparent. Returns the new deadline.
     fn new_epoch(&mut self) -> Result<u64, Error>;
+
+    /// Metadata required for resources for the component model.
+    #[cfg(feature = "component-model")]
+    fn component_calls(&mut self) -> &mut component::CallContexts;
 }
 
 /// Functionality required by this crate for a particular module. This

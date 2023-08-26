@@ -150,6 +150,7 @@ pub enum FileType {
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct FdFlags: u32 {
         const APPEND   = 0b1;
         const DSYNC    = 0b10;
@@ -160,6 +161,7 @@ bitflags! {
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct SdFlags: u32 {
         const RD = 0b1;
         const WR = 0b10;
@@ -167,11 +169,13 @@ bitflags! {
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct SiFlags: u32 {
     }
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct RiFlags: u32 {
         const RECV_PEEK    = 0b1;
         const RECV_WAITALL = 0b10;
@@ -179,12 +183,14 @@ bitflags! {
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct RoFlags: u32 {
         const RECV_DATA_TRUNCATED = 0b1;
     }
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct OFlags: u32 {
         const CREATE    = 0b1;
         const DIRECTORY = 0b10;
@@ -220,17 +226,27 @@ impl TableFileExt for crate::table::Table {
 
 pub(crate) struct FileEntry {
     pub file: Box<dyn WasiFile>,
+    pub access_mode: FileAccessMode,
+}
+
+bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub struct FileAccessMode : u32 {
+        const READ = 0b1;
+        const WRITE= 0b10;
+    }
 }
 
 impl FileEntry {
-    pub fn new(file: Box<dyn WasiFile>) -> Self {
-        FileEntry { file }
+    pub fn new(file: Box<dyn WasiFile>, access_mode: FileAccessMode) -> Self {
+        FileEntry { file, access_mode }
     }
 
     pub async fn get_fdstat(&self) -> Result<FdStat, Error> {
         Ok(FdStat {
             filetype: self.file.get_filetype().await?,
             flags: self.file.get_fdflags().await?,
+            access_mode: self.access_mode,
         })
     }
 }
@@ -239,6 +255,7 @@ impl FileEntry {
 pub struct FdStat {
     pub filetype: FileType,
     pub flags: FdFlags,
+    pub access_mode: FileAccessMode,
 }
 
 #[derive(Debug, Clone)]

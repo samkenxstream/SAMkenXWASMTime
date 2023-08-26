@@ -47,15 +47,15 @@ pub struct CompileCommand {
     target: Option<String>,
 
     /// The path of the output compiled module; defaults to <MODULE>.cwasm
-    #[clap(short = 'o', long, value_name = "OUTPUT", parse(from_os_str))]
+    #[clap(short = 'o', long, value_name = "OUTPUT")]
     output: Option<PathBuf>,
 
     /// The directory path to write clif files into, one clif file per wasm function.
-    #[clap(long = "emit-clif", value_name = "PATH", parse(from_os_str))]
+    #[clap(long = "emit-clif", value_name = "PATH")]
     emit_clif: Option<PathBuf>,
 
     /// The path of the WebAssembly to compile
-    #[clap(index = 1, value_name = "MODULE", parse(from_os_str))]
+    #[clap(index = 1, value_name = "MODULE")]
     module: PathBuf,
 }
 
@@ -98,25 +98,13 @@ impl CompileCommand {
             output
         });
 
-        // If the component-model proposal is enabled and the binary we're
-        // compiling looks like a component, tested by sniffing the first 8
-        // bytes with the current component model proposal.
-        #[cfg(feature = "component-model")]
-        {
-            if let Ok(wasmparser::Chunk::Parsed {
-                payload:
-                    wasmparser::Payload::Version {
-                        encoding: wasmparser::Encoding::Component,
-                        ..
-                    },
-                ..
-            }) = wasmparser::Parser::new(0).parse(&input, true)
-            {
-                fs::write(output, engine.precompile_component(&input)?)?;
-                return Ok(());
-            }
-        }
-        fs::write(output, engine.precompile_module(&input)?)?;
+        let output_bytes = if wasmparser::Parser::is_component(&input) {
+            engine.precompile_component(&input)?
+        } else {
+            engine.precompile_module(&input)?
+        };
+        fs::write(&output, output_bytes)
+            .with_context(|| format!("failed to write output: {}", output.display()))?;
 
         Ok(())
     }
